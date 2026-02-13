@@ -14,6 +14,19 @@ Or with short flags:
 python backporter.py -t myorg/myrepo:main -p https://github.com/myorg/myrepo/pull/42
 ```
 
+### Example: fork backport with changelog description
+
+```bash
+python3 backporter.py -C ../releases/248 -p https://github.com/ClickHouse/ClickHouse/pull/72226 --make-description -t Altinity/ClickHouse:customizations/24.8.14
+```
+
+| Argument | Meaning |
+|----------|---------|
+| `-C ../releases/248` | Use this existing clone (no fresh clone). |
+| `-p https://github.com/ClickHouse/ClickHouse/pull/72226` | PR to backport (from upstream ClickHouse). |
+| `--make-description` | Print changelog category + entry from the PR body to stdout (and append PR link + author to the entry). |
+| `-t Altinity/ClickHouse:customizations/24.8.14` | Target: push to repo `Altinity/ClickHouse`, branch `customizations/24.8.14`. Backport branch will be `backports/customizations/24.8.14/72226`. |
+
 ## What it does
 
 1. Clones the target repo and checks out the target branch
