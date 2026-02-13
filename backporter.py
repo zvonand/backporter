@@ -21,6 +21,8 @@ import tempfile
 
 from github import Github
 
+from changelog_extract import make_changelog_description
+
 
 def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
     """Run a command and return the result."""
@@ -29,6 +31,49 @@ def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subproces
         print(result.stderr, file=sys.stderr)
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
     return result
+
+
+def run_no_check(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
+    """Run a command and return the result without raising on non-zero exit."""
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+
+
+def get_conflicted_files(cwd: str) -> list[str]:
+    """Return list of paths with merge conflicts (unmerged)."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        cwd=cwd, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return []
+    return [p for p in result.stdout.strip().splitlines() if p]
+
+
+def branch_exists(cwd: str, branch: str) -> bool:
+    """Return True if the given local branch exists."""
+    result = run_no_check(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=cwd,
+    )
+    return result.returncode == 0
+
+
+def is_unresolved_state(stderr: str) -> bool:
+    """Return True if git stderr indicates unresolved conflicts or index state."""
+    s = (stderr or "").lower()
+    return "resolve" in s or "unmerged" in s or "index" in s
+
+
+def prompt_yes_no(question: str, default_no: bool = True) -> bool:
+    """Prompt with question; return True for yes, False for no."""
+    suffix = " [y/N]: " if default_no else " [Y/n]: "
+    try:
+        answer = input(question + suffix).strip().lower()
+    except EOFError:
+        answer = ""
+    if not answer:
+        return not default_no
+    return answer in ("y", "yes")
 
 
 def parse_target(target: str) -> tuple[str, str]:
@@ -74,13 +119,17 @@ def main() -> None:
     )
     parser.add_argument(
         "-t", "--target",
-        required=True,
         help="Target in format owner/repo:branch (e.g. myorg/myrepo:main)",
     )
     parser.add_argument(
         "-p", "--pr",
         required=True,
         help="URL of the PR to backport (e.g. https://github.com/owner/repo/pull/123)",
+    )
+    parser.add_argument(
+        "--make-description",
+        action="store_true",
+        help="Output changelog description (category + entry) from the PR body to stdout",
     )
     parser.add_argument(
         "-C", "--repo-dir",
@@ -98,8 +147,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    target_repo, target_branch = parse_target(args.target)
+    if not args.make_description and not args.target:
+        parser.error("--target is required unless --make-description is used")
+
     pr_repo, pr_number = parse_pr_url(args.pr)
+
+    # --make-description only: fetch PR body, output changelog description, exit
+    if args.make_description and not args.target:
+        gh = Github(args.token) if args.token else Github()
+        repo = gh.get_repo(pr_repo)
+        pr = repo.get_pull(pr_number)
+        description = make_changelog_description(
+            pr.body,
+            pr_url=pr.html_url,
+            pr_author=pr.user.login if pr.user else None,
+        )
+        print(description)
+        return
+
+    target_repo, target_branch = parse_target(args.target)
 
     backport_branch = f"backports/{target_branch}/{pr_number}"
     clone_url = f"https://github.com/{target_repo}.git"
@@ -120,17 +186,56 @@ def main() -> None:
         repo_dir = os.path.join(work_dir, "repo")
         cleanup_work_dir = not args.work_dir
 
+    def _print_description_and_exit(exit_code: int = 0) -> None:
+        if args.make_description:
+            gh = Github(args.token) if args.token else Github()
+            repo_obj = gh.get_repo(pr_repo)
+            pr = repo_obj.get_pull(pr_number)
+            description = make_changelog_description(
+                pr.body,
+                pr_url=pr.html_url,
+                pr_author=pr.user.login if pr.user else None,
+            )
+            if description:
+                print("\n--- Changelog description ---\n")
+                print(description)
+        sys.exit(exit_code)
+
     try:
         if args.repo_dir:
             # Use existing repo: fetch and checkout target branch
             print(f"Fetching latest from {target_repo}...")
             run(["git", "fetch", "origin", target_branch], cwd=repo_dir)
-            run(["git", "checkout", target_branch], cwd=repo_dir)
-            run(["git", "pull", "origin", target_branch], cwd=repo_dir)
+            co_result = run_no_check(["git", "checkout", target_branch], cwd=repo_dir)
+            if co_result.returncode != 0 and is_unresolved_state(co_result.stderr):
+                print(co_result.stderr, file=sys.stderr)
+                if not prompt_yes_no(
+                    "Unresolved conflicts or dirty state. Recreate backport branch from clean target?"
+                ):
+                    print("Leaving repo as is.", file=sys.stderr)
+                    _print_description_and_exit(0)
+                run_no_check(["git", "cherry-pick", "--abort"], cwd=repo_dir)
+                run(["git", "checkout", target_branch], cwd=repo_dir)
+                run(["git", "pull", "origin", target_branch], cwd=repo_dir)
+                run(["git", "branch", "-D", backport_branch], cwd=repo_dir)
+            else:
+                if co_result.returncode != 0:
+                    print(co_result.stderr, file=sys.stderr)
+                    raise RuntimeError(f"Command failed: git checkout {target_branch}")
+                run(["git", "pull", "origin", target_branch], cwd=repo_dir)
         else:
             # Clone the target repo
             print(f"Cloning {target_repo}...")
             run(["git", "clone", "--branch", target_branch, clone_url, repo_dir])
+
+        # If backport branch already exists, prompt
+        if branch_exists(repo_dir, backport_branch):
+            if not prompt_yes_no(
+                f"Branch '{backport_branch}' already exists. Delete and recreate from clean target?"
+            ):
+                print("Aborted.", file=sys.stderr)
+                _print_description_and_exit(0)
+            run(["git", "branch", "-D", backport_branch], cwd=repo_dir)
 
         # Create the backport branch (checkout -b)
         print(f"Creating branch {backport_branch}...")
@@ -152,13 +257,52 @@ def main() -> None:
             run(["git", "fetch", "upstream", merge_sha], cwd=repo_dir)
 
         print("Cherry-picking merge commit...")
-        run(["git", "cherry-pick", "-m", "1", merge_sha, "--no-edit"], cwd=repo_dir)
+        cp_result = run_no_check(
+            ["git", "cherry-pick", "-m", "1", merge_sha, "--no-edit"],
+            cwd=repo_dir,
+        )
+
+        def _print_description() -> None:
+            if args.make_description:
+                gh = Github(args.token) if args.token else Github()
+                repo_obj = gh.get_repo(pr_repo)
+                pr = repo_obj.get_pull(pr_number)
+                description = make_changelog_description(
+                    pr.body,
+                    pr_url=pr.html_url,
+                    pr_author=pr.user.login if pr.user else None,
+                )
+                if description:
+                    print("\n--- Changelog description ---\n")
+                    print(description)
+
+        if cp_result.returncode != 0:
+            # Cherry-pick failed; may be conflicts
+            print(cp_result.stderr, file=sys.stderr)
+            conflicted = get_conflicted_files(repo_dir)
+            if conflicted:
+                print(
+                    f"\nConflicts in {len(conflicted)} file(s); branch left with conflicts for manual resolve:",
+                    file=sys.stderr,
+                )
+                for path in conflicted:
+                    print(f"  {path}", file=sys.stderr)
+                print(
+                    "\nResolve conflicts, then: git add <paths> && git cherry-pick --continue",
+                    file=sys.stderr,
+                )
+                _print_description()
+                sys.exit(1)
+            raise RuntimeError(
+                f"Command failed: git cherry-pick -m 1 {merge_sha} --no-edit"
+            )
 
         # Push to target repo
         print(f"Pushing {backport_branch} to {target_repo}...")
         run(["git", "push", "origin", backport_branch], cwd=repo_dir)
 
         print(f"\nDone! Branch {backport_branch} has been pushed to {target_repo}.")
+        _print_description()
 
     except RuntimeError as e:
         print(f"Error: {e}", file=sys.stderr)
