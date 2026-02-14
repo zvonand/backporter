@@ -70,12 +70,13 @@ def make_changelog_description(
         start = _find_line_start(pr_body, entry_match.start())
         end = _find_section_end(pr_body, entry_match.end(), next_section)
         section = pr_body[start:end].strip()
-        # Take only the first line of content (any newline is delimiter; ignore "Fix #123" etc.)
+        # Take only the first non-empty line of content (skip blank lines after header; any newline is delimiter)
         first_nl = section.find("\n")
         if first_nl >= 0:
-            second_nl = section.find("\n", first_nl + 1)
-            if second_nl >= 0:
-                section = section[:second_nl].rstrip()
+            header_line = section[: first_nl + 1]
+            rest = section[first_nl + 1 :]
+            first_content_line = next((ln for ln in rest.split("\n") if ln.strip()), "").strip()
+            section = (header_line + first_content_line) if first_content_line else section
         if section and entry_suffix:
             # Append suffix to the entry content (after the header line)
             first_nl = section.find("\n")
