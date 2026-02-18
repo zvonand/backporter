@@ -37,15 +37,45 @@ def run_no_check(cmd: list[str], cwd: str | None = None) -> subprocess.Completed
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
-def get_conflicted_files(cwd: str) -> list[str]:
-    """Return list of paths with merge conflicts (unmerged)."""
+# Git status short format: first 2 chars = index,worktree state. Unmerged codes:
+# UU=both modified, DU=deleted by us, UD=deleted by them, DD=both deleted,
+# AA=both added, AU=added by us, UA=added by them
+_CONFLICT_TYPE = {
+    "UU": "both modified",
+    "DU": "modify/delete (deleted by us)",
+    "UD": "modify/delete (deleted by them)",
+    "DD": "both deleted",
+    "AA": "both added",
+    "AU": "added by us",
+    "UA": "added by them",
+}
+
+
+def get_conflicted_files_with_status(cwd: str) -> list[tuple[str, str]]:
+    """Return list of (path, conflict_type) for unmerged files."""
     result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=U"],
+        ["git", "status", "--porcelain"],
         cwd=cwd, capture_output=True, text=True
     )
     if result.returncode != 0:
         return []
-    return [p for p in result.stdout.strip().splitlines() if p]
+    out = []
+    for line in result.stdout.strip().splitlines():
+        if not line or len(line) < 4:
+            continue
+        code = line[:2]
+        path = line[3:].strip()
+        # Handle "path -> path2" for renames (we only care about first path for conflicts)
+        if " -> " in path:
+            path = path.split(" -> ")[0].strip()
+        if code in _CONFLICT_TYPE and path:
+            out.append((path, _CONFLICT_TYPE[code]))
+    return out
+
+
+def get_conflicted_files(cwd: str) -> list[str]:
+    """Return list of paths with merge conflicts (unmerged)."""
+    return [p for p, _ in get_conflicted_files_with_status(cwd)]
 
 
 def branch_exists(cwd: str, branch: str) -> bool:
@@ -334,14 +364,14 @@ def main() -> None:
         if cp_result.returncode != 0:
             # Cherry-pick failed; may be conflicts
             print(cp_result.stderr, file=sys.stderr)
-            conflicted = get_conflicted_files(repo_dir)
+            conflicted = get_conflicted_files_with_status(repo_dir)
             if conflicted:
                 print(
                     f"\nConflicts in {len(conflicted)} file(s); branch left with conflicts for manual resolve:",
                     file=sys.stderr,
                 )
-                for path in conflicted:
-                    print(f"  {path}", file=sys.stderr)
+                for path, ctype in conflicted:
+                    print(f"  {path}  ({ctype})", file=sys.stderr)
                 print(
                     "\nResolve conflicts, then run: git add <paths> && git cherry-pick --continue",
                     file=sys.stderr,
