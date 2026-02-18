@@ -1,22 +1,26 @@
+Metadata-Version: 2.4
+Name: backporter
+Version: 0.1.0
+Summary: Backport GitHub PRs to a target branch
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: PyGithub>=2.0.0
+
 # backporter
 
 A simple Python script to backport GitHub PRs to a target branch.
 
 ## Usage
 
-After `pip install -e .` you can run the CLI from anywhere:
-
 ```bash
-backporter --target owner/repo:branch --pr https://github.com/owner/repo/pull/123
+python backporter.py --target owner/repo:branch --pr https://github.com/owner/repo/pull/123
 ```
 
-Or from the repo without installing (run from repo root):
+Or with short flags:
 
 ```bash
 python backporter.py -t myorg/myrepo:main -p https://github.com/myorg/myrepo/pull/42
 ```
-
-You can also import the package: `from backporter import main, make_changelog_description`.
 
 ### Example: fork backport with changelog description
 
@@ -38,21 +42,11 @@ python3 backporter.py -C ../releases/248 -p https://github.com/ClickHouse/ClickH
 3. Cherry-picks the PR merge commit into this branch
 4. Pushes the branch to the target repo
 
-## Installation (local use, no PyPI)
-
-From the repo directory, install in editable mode so the `backporter` command is on your PATH and the package can be imported:
-
-```bash
-pip install -e .
-```
-
-Or use a venv: `python3 -m venv .venv && .venv/bin/pip install -e .`
-
 ## Requirements
 
 - Python 3.10+
 - Git
-- [PyGithub](https://github.com/PyGithub/PyGithub) (installed automatically with `pip install -e .`)
+- [PyGithub](https://github.com/PyGithub/PyGithub): `pip install -r requirements.txt` (or use a venv)
 - Network access to GitHub (HTTPS; use `git credential` for private repos)
 
 A `GITHUB_TOKEN` env var (or `--token`) is recommended for private repos and to avoid API rate limits.

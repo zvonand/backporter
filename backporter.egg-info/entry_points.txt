@@ -1,0 +1,2 @@
+[console_scripts]
+backporter = backporter.main:main
