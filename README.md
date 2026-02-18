@@ -47,9 +47,10 @@ A `GITHUB_TOKEN` env var (or `--token`) is recommended for private repos and to 
 
 | Option | Description |
 |--------|-------------|
-| `-t`, `--target` | Target in format `owner/repo:branch` (required unless `--make-description` only) |
-| `-p`, `--pr` | URL of the PR to backport |
+| `-t`, `--target` | Target in format `owner/repo:branch` (required unless `--make-description` only or `--conflicts-resolved`) |
+| `-p`, `--pr` | URL of the PR to backport (not needed with `--conflicts-resolved`) |
 | `--make-description` | Output changelog description (category + entry) from the PR body to stdout |
+| `--conflicts-resolved` | Finish backport after you resolved conflicts: `git add .`, `cherry-pick --continue`, push |
 | `-C`, `--repo-dir` | Use existing cloned repo instead of cloning (avoids re-cloning large repos) |
 | `--work-dir` | Directory to clone into when not using -C (default: temp dir, deleted after) |
 | `--token` | GitHub token for API (default: GITHUB_TOKEN env var) |
@@ -74,7 +75,15 @@ If the repo is in a conflicted or dirty state (e.g. you left a cherry-pick with 
 
 ## Conflicts
 
-If the cherry-pick hits merge conflicts, the script does **not** abort the cherry-pick: the branch is left with conflicts for you to resolve manually. The script prints the list of conflicted files and exits with code 1. If `--make-description` was given, the changelog description is still printed. After resolving conflicts, run `git add <paths>` and `git cherry-pick --continue`, then push when ready.
+If the cherry-pick hits merge conflicts, the script does **not** abort the cherry-pick: the branch is left with conflicts for you to resolve manually. The script prints the list of conflicted files and exits with code 1. If `--make-description` was given, the changelog description is still printed.
+
+After resolving conflicts, you can either run `git add <paths>` and `git cherry-pick --continue` and push by hand, or use:
+
+```bash
+python3 backporter.py --conflicts-resolved -C ../releases/248 -t Altinity/ClickHouse:customizations/24.8.14
+```
+
+That runs `git add .`, `git cherry-pick --continue` (with no editor), and pushes the current branch to the target repo. No `-p` (PR URL) is needed.
 
 ## Changelog description
 

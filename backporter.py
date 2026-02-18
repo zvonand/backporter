@@ -64,6 +64,26 @@ def is_unresolved_state(stderr: str) -> bool:
     return "resolve" in s or "unmerged" in s or "index" in s
 
 
+def is_cherry_pick_in_progress(cwd: str) -> bool:
+    """Return True if a cherry-pick is in progress (e.g. after resolving conflicts)."""
+    result = run_no_check(
+        ["git", "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"],
+        cwd=cwd,
+    )
+    return result.returncode == 0
+
+
+def get_current_branch(cwd: str) -> str:
+    """Return the current branch name."""
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=cwd, capture_output=True, text=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("Could not determine current branch")
+    return result.stdout.strip()
+
+
 def prompt_yes_no(question: str, default_no: bool = True) -> bool:
     """Prompt with question; return True for yes, False for no."""
     suffix = " [y/N]: " if default_no else " [Y/n]: "
@@ -123,13 +143,18 @@ def main() -> None:
     )
     parser.add_argument(
         "-p", "--pr",
-        required=True,
         help="URL of the PR to backport (e.g. https://github.com/owner/repo/pull/123)",
     )
     parser.add_argument(
         "--make-description",
         action="store_true",
         help="Output changelog description (category + entry) from the PR body to stdout",
+    )
+    parser.add_argument(
+        "--conflicts-resolved",
+        action="store_true",
+        dest="conflicts_resolved",
+        help="Finish backport after resolving conflicts: git add ., cherry-pick --continue, push",
     )
     parser.add_argument(
         "-C", "--repo-dir",
@@ -147,6 +172,37 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.conflicts_resolved:
+        if not args.repo_dir or not args.target:
+            parser.error("--conflicts-resolved requires -C and -t")
+        target_repo, _ = parse_target(args.target)
+        repo_dir = os.path.abspath(args.repo_dir)
+        if not os.path.isdir(os.path.join(repo_dir, ".git")):
+            print(f"Error: {repo_dir} is not a git repository", file=sys.stderr)
+            sys.exit(1)
+        if not is_cherry_pick_in_progress(repo_dir):
+            print("Error: no cherry-pick in progress (CHERRY_PICK_HEAD not found).", file=sys.stderr)
+            sys.exit(1)
+        print("Staging all changes...")
+        run(["git", "add", "."], cwd=repo_dir)
+        print("Continuing cherry-pick...")
+        env = os.environ.copy()
+        env["GIT_EDITOR"] = "true"
+        result = subprocess.run(
+            ["git", "cherry-pick", "--continue"],
+            cwd=repo_dir, env=env, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(result.stderr or result.stdout, file=sys.stderr)
+            sys.exit(1)
+        current_branch = get_current_branch(repo_dir)
+        print(f"Pushing {current_branch} to {target_repo}...")
+        run(["git", "push", "origin", current_branch], cwd=repo_dir)
+        print(f"\nDone! Branch {current_branch} has been pushed to {target_repo}.")
+        sys.exit(0)
+
+    if not args.pr:
+        parser.error("--pr is required (unless --conflicts-resolved is used)")
     if not args.make_description and not args.target:
         parser.error("--target is required unless --make-description is used")
 
@@ -288,7 +344,11 @@ def main() -> None:
                 for path in conflicted:
                     print(f"  {path}", file=sys.stderr)
                 print(
-                    "\nResolve conflicts, then: git add <paths> && git cherry-pick --continue",
+                    "\nResolve conflicts, then run: git add <paths> && git cherry-pick --continue",
+                    file=sys.stderr,
+                )
+                print(
+                    "Or after resolving: python3 backporter.py --conflicts-resolved -C <repo-dir> -t <target>",
                     file=sys.stderr,
                 )
                 _print_description()
