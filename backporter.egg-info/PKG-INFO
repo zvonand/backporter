@@ -8,28 +8,30 @@ Requires-Dist: PyGithub>=2.0.0
 
 # backporter
 
-A simple Python script to backport GitHub PRs to a target branch.
+A simple CLI to backport GitHub PRs to a target branch.
+
+## Installation
+
+From the repo directory, install in editable mode so the `backporter` command is on your PATH:
+
+```bash
+pip install -e .
+```
+
+Or use a venv: `python3 -m venv .venv && .venv/bin/pip install -e .`
 
 ## Usage
 
-After `pip install -e .` you can run the CLI from anywhere:
+Run from anywhere after installing:
 
 ```bash
-backporter --target owner/repo:branch --pr https://github.com/owner/repo/pull/123
+backporter -t owner/repo:branch -p https://github.com/owner/repo/pull/123
 ```
-
-Or from the repo without installing (run from repo root):
-
-```bash
-python backporter.py -t myorg/myrepo:main -p https://github.com/myorg/myrepo/pull/42
-```
-
-You can also import the package: `from backporter import main, make_changelog_description`.
 
 ### Example: fork backport with changelog description
 
 ```bash
-python3 backporter.py -C ../releases/248 -p https://github.com/ClickHouse/ClickHouse/pull/72226 --make-description -t Altinity/ClickHouse:customizations/24.8.14
+backporter -C ../releases/248 -p https://github.com/ClickHouse/ClickHouse/pull/72226 --make-description -t Altinity/ClickHouse:customizations/24.8.14
 ```
 
 | Argument | Meaning |
@@ -45,16 +47,6 @@ python3 backporter.py -C ../releases/248 -p https://github.com/ClickHouse/ClickH
 2. Creates a new branch named `<target_branch>/<PR_number>` (e.g. `main/42`)
 3. Cherry-picks the PR merge commit into this branch
 4. Pushes the branch to the target repo
-
-## Installation (local use, no PyPI)
-
-From the repo directory, install in editable mode so the `backporter` command is on your PATH and the package can be imported:
-
-```bash
-pip install -e .
-```
-
-Or use a venv: `python3 -m venv .venv && .venv/bin/pip install -e .`
 
 ## Requirements
 
@@ -82,7 +74,7 @@ A `GITHUB_TOKEN` env var (or `--token`) is recommended for private repos and to 
 For large repos, reuse your existing clone instead of re-cloning:
 
 ```bash
-python3 backporter.py -C /path/to/repo -t myorg/myrepo:main -p https://github.com/myorg/myrepo/pull/42
+backporter -C /path/to/repo -t myorg/myrepo:main -p https://github.com/myorg/myrepo/pull/42
 ```
 
 The script will fetch the latest target branch, create the backport branch, cherry-pick, and push. Use a clean working tree.
@@ -102,7 +94,7 @@ If the cherry-pick hits merge conflicts, the script does **not** abort the cherr
 After resolving conflicts, you can either run `git add <paths>` and `git cherry-pick --continue` and push by hand, or use:
 
 ```bash
-python3 backporter.py --conflicts-resolved -C ../releases/248 -t Altinity/ClickHouse:customizations/24.8.14
+backporter --conflicts-resolved -C ../releases/248 -t Altinity/ClickHouse:customizations/24.8.14
 ```
 
 That runs `git add .`, `git cherry-pick --continue` (with no editor), and pushes the current branch to the target repo. No `-p` (PR URL) is needed.
@@ -112,7 +104,7 @@ That runs `git add .`, `git cherry-pick --continue` (with no editor), and pushes
 To output the changelog description (Changelog category + Changelog entry) from a PR body to stdout:
 
 ```bash
-python backporter.py --make-description -p https://github.com/owner/repo/pull/123
+backporter --make-description -p https://github.com/owner/repo/pull/123
 ```
 
 With `--target`, the description is printed after a successful backport. Without `--target`, only the description is printed (no clone/cherry-pick/push).
@@ -122,5 +114,5 @@ With `--target`, the description is printed after a successful backport. Without
 When your target repo is a fork of the base repo (where the PR was merged), the script adds the base repo as an `upstream` remote and fetches from it. Cherry-pick uses `-m 1` for merge commits.
 
 ```bash
-python3 backporter.py -C /path/to/your/fork -t myorg/repo:main -p https://github.com/upstream/repo/pull/100
+backporter -C /path/to/your/fork -t myorg/repo:main -p https://github.com/upstream/repo/pull/100
 ```

@@ -73,9 +73,9 @@ def get_conflicted_entries(cwd: str) -> list[tuple[str, str]]:
         if code in _CONFLICT_TYPE_LABELS:
             label = _CONFLICT_TYPE_LABELS[code]
             entries.append((path, label))
-        elif code[0] in "UAD" or code[1] in "UAD":
-            # Other unmerged (e.g. AU, UA)
-            entries.append((path, "unmerged"))
+        # Exclude other unmerged codes (e.g. UA = added by them, AU = added by us):
+        # we only report actual conflicts (both modified, both added, both deleted,
+        # or modify/delete), not "new file" or one-sided add.
     return entries
 
 
