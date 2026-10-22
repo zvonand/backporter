@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backporter"
-version = "0.1.0"
-description = "Backport GitHub PRs to a target branch"
+version = "0.2.0"
+description = "Track and perform ClickHouse backports via a GitHub Project"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "PyGithub>=2.0.0",
+    "anthropic>=2.1.0",
+    "tomli>=1.1.0; python_version<'3.11'",
 ]
 
 [project.scripts]
@@ -18,3 +20,6 @@ backporter = "backporter.main:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["backporter*"]
+
+[tool.setuptools.package-data]
+backporter = ["config.toml"]
