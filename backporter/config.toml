@@ -1,6 +1,6 @@
 # Set by `backporter init <project URL>`.
 project_owner = "Altinity"
-project_number = 38
+project_number = 39
 
 # Branch in Altinity/ClickHouse for each version key (<flavor>-X.Y).
 # Every version in the project needs an entry; add it here before `backporter add-version`.

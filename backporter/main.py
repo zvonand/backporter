@@ -7,7 +7,7 @@ Backport tracker backed by a GitHub Project.
     backporter remove <PR-URL> <version>      stop tracking version and what only it implied
     backporter scan [--version KEY]           process web UI requests, refresh statuses, list pending
     backporter start <PR-URL> [version ...]   cherry-pick, push, open backport PRs (--ai: AI resolves conflicts)
-    backporter run [--no-ai]                  scan, then backport everything set to Approved in the project
+    backporter run [--no-ai]                  scan, then backport everything with Decision Approved
     backporter continue <PR-URL> <version>    finish after resolving conflicts (--ai: let AI resolve them)
     backporter mark <PR-URL> <version> present|not-applicable [--by URL] [--note TEXT]
     backporter describe <PR-URL>              print changelog description of a PR
@@ -32,7 +32,7 @@ from backporter.config import (
 )
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
-    APPROVED, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
+    APPROVED, DISCARDED, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -58,8 +58,8 @@ def open_project(gh: Github, config: Config) -> Project:
 
 
 def tracked_items(project: Project) -> list[Item]:
-    """Items created by the backporter; the rest are requests added by hand."""
-    return [i for i in project.items() if i.requested]
+    """Items created by the backporter (not requests, not processed source PR rows)."""
+    return [i for i in project.items() if i.requested in (EXPLICIT, IMPLIED)]
 
 
 def project_versions(project: Project, config: Config) -> list[Version]:
@@ -76,20 +76,29 @@ def pr_items(project: Project, url: str) -> dict[str, Item]:
     return {i.version: i for i in tracked_items(project) if i.source_pr == url}
 
 
-def create_item(project: Project, version: Version, url: str, title: str, requested: str) -> None:
+def create_item(
+    project: Project, version: Version, url: str, title: str, requested: str, requested_by: str,
+) -> Item:
     """Add a Not started item; title is '<owner/repo>#<N> <source PR title>'."""
-    project.add_item(
-        title=f"[{version.key}] {title}",
+    title = f"[{version.key}] {title}"
+    item_id = project.add_item(
+        title=title,
         body=url,
         values={
             F_SOURCE_PR: url,
             F_VERSION: version.key,
             F_FLAVOR: version.flavor,
             F_REQUESTED: requested,
+            F_REQUESTED_BY: requested_by,
             F_STATUS: NOT_STARTED,
         },
     )
     print(f"{version.key}: added {url} ({requested})")
+    return Item(
+        id=item_id, title=title, body=url, content_url="", source_pr=url, version=version.key, flavor=version.flavor,
+        requested=requested, status=NOT_STARTED, backport_pr="", note="", decision="", requested_by=requested_by,
+        creator="",
+    )
 
 
 def changelog(pr: PullRequest) -> str:
@@ -139,50 +148,55 @@ def cmd_add_version(args, gh: Github, config: Config) -> None:
             for v in closure(find_version(versions, i.version), versions)
         }
         title = items[0].title.split("] ", 1)[-1]
+        requested_by = next((i.requested_by for i in items if i.requested == EXPLICIT and i.requested_by), "")
         for version in new:
             if version.key in needed and version.key not in present:
-                create_item(project, version, url, title, IMPLIED)
+                create_item(project, version, url, title, IMPLIED, requested_by)
 
 
-def track(gh: Github, project: Project, config: Config, pr_url: str, version_key: str) -> None:
-    """Track a backport of pr_url to version_key (explicit) and every version it implies."""
+def track(
+    gh: Github, project: Project, config: Config, pr_url: str, version_key: str, requested_by: str,
+    created: list[Item] | None = None,
+) -> None:
+    """
+    Track a backport of pr_url to version_key (explicit) and every version it implies, for `requested_by`.
+    New items are appended to `created`; items already in it count as existing, since GitHub's
+    item list can lag behind for a while after items are added.
+    """
+    created = [] if created is None else created
     pr_repo, number = git_ops.parse_pr_url(pr_url)
     url = source_url(pr_repo, number)
     versions = project_versions(project, config)
     target = find_version(versions, version_key)
     pr = gh.get_repo(pr_repo).get_pull(number)
-    existing = pr_items(project, url)
+    existing = {**pr_items(project, url), **{i.version: i for i in created if i.source_pr == url}}
     for v in closure(target, versions):
         requested = EXPLICIT if v == target else IMPLIED
         item = existing.get(v.key)
         if item:
             if requested == EXPLICIT and item.requested != EXPLICIT:
                 project.set_value(item.id, F_REQUESTED, EXPLICIT)
+                project.set_value(item.id, F_REQUESTED_BY, requested_by)
                 print(f"{v.key}: marked explicit")
             continue
-        create_item(project, v, url, f"{pr_repo}#{number} {pr.title}", requested)
+        created.append(create_item(project, v, url, f"{pr_repo}#{number} {pr.title}", requested, requested_by))
 
 
 def cmd_add(args, gh: Github, config: Config) -> None:
-    track(gh, open_project(gh, config), config, args.pr, args.version)
+    track(gh, open_project(gh, config), config, args.pr, args.version, gh.get_user().login)
 
 
-def process_requests(gh: Github, project: Project, config: Config) -> None:
+def process_requests(gh: Github, project: Project, config: Config) -> list[Item]:
     """
     Turn items added by hand in the web UI into tracked items, then delete them.
-    The PR URL comes from the Source PR field, a linked PR, the title or the body;
-    versions come from the Version field and from version keys in the title or body.
+    The PR URL comes from the Source PR field, the item's own PR, the title or the body; versions come from
+    the Version field and from version keys in the title, body or Note. Whoever added the request row
+    becomes "Requested by".
     """
     keys = set(project.version_keys())
+    created: list[Item] = []
     for item in project.items():
         if item.requested:
-            continue
-        if item.content_url and not item.content_url.lower().startswith(f"https://github.com/{TARGET_REPO}/".lower()):
-            # Deleting this item could show up on that PR's timeline; leave it to be removed by hand.
-            print(
-                f"Request '{item.title}': {item.content_url} added as an item; skipped. Remove it and add a draft "
-                "item with the link in the title instead", file=sys.stderr,
-            )
             continue
         text = " ".join((item.source_pr, item.content_url, item.title, item.body))
         try:
@@ -190,7 +204,9 @@ def process_requests(gh: Github, project: Project, config: Config) -> None:
         except ValueError:
             print(f"Request '{item.title}': no PR URL found; skipped", file=sys.stderr)
             continue
-        requested = ([item.version] if item.version else []) + _VERSION_KEY_RE.findall(f"{item.title} {item.body}")
+        requested = ([item.version] if item.version else []) + _VERSION_KEY_RE.findall(
+            f"{item.title} {item.body} {item.note}"
+        )
         unknown = [k for k in requested if k not in keys]
         if not requested or unknown:
             print(
@@ -201,8 +217,9 @@ def process_requests(gh: Github, project: Project, config: Config) -> None:
         url = source_url(pr_repo, number)
         print(f"Request '{item.title}': {url} -> {', '.join(dict.fromkeys(requested))}")
         for key in dict.fromkeys(requested):
-            track(gh, project, config, url, key)
+            track(gh, project, config, url, key, item.creator, created)
         project.delete_item(item.id)
+    return created
 
 
 def cmd_remove(args, gh: Github, config: Config) -> None:
@@ -239,17 +256,19 @@ def cmd_scan(args, gh: Github, config: Config) -> None:
 def scan(gh: Github, config: Config, only_version: str | None) -> None:
     """Process web requests, refresh statuses from GitHub, report pending and missing items."""
     project = open_project(gh, config)
-    process_requests(gh, project, config)
+    created = process_requests(gh, project, config)
     version_list = project_versions(project, config)
     if only_version:
         find_version(version_list, only_version)
     versions = {v.key: v for v in version_list}
     repo = gh.get_repo(TARGET_REPO)
     items = tracked_items(project)
+    listed = {i.id for i in items}
+    items += [i for i in created if i.id not in listed]
 
     for item in items:
         version = versions.get(item.version)
-        if item.status in FINAL_STATUSES or version is None:
+        if item.status in FINAL_STATUSES or item.decision == DISCARDED or version is None:
             continue
         if only_version and item.version != only_version:
             continue
@@ -267,7 +286,9 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
 
     pending: dict[str, list[Item]] = defaultdict(list)
     for item in items:
-        if item.status in (NOT_STARTED, APPROVED, CONFLICTS) and (not only_version or item.version == only_version):
+        if item.status in (NOT_STARTED, CONFLICTS) and item.decision != DISCARDED and (
+            not only_version or item.version == only_version
+        ):
             pending[item.version].append(item)
     if not pending:
         print("No pending backports.")
@@ -275,7 +296,7 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
         if pending.get(v.key):
             print(f"\n{v.key} ({v.branch}):")
             for item in pending[v.key]:
-                print(f"  {item.status:<12} {item.source_pr}  {item.title}")
+                print(f"  {item.status:<12} {item.decision or 'undecided':<10} {item.source_pr}  {item.title}")
 
     by_pr: dict[str, list[Item]] = defaultdict(list)
     for item in items:
@@ -445,7 +466,10 @@ def cmd_start(args, gh: Github, config: Config) -> None:
         if untracked:
             raise RuntimeError(f"Not tracked: {', '.join(untracked)}; run `backporter add` first")
     else:
-        targets = [v for v in versions if v.key in items and items[v.key].status in (NOT_STARTED, APPROVED)]
+        targets = [
+            v for v in versions
+            if v.key in items and items[v.key].status == NOT_STARTED and items[v.key].decision != DISCARDED
+        ]
     if not targets:
         print("Nothing to start.")
         return
@@ -458,7 +482,7 @@ def cmd_start(args, gh: Github, config: Config) -> None:
 
 
 def cmd_run(args, gh: Github, config: Config) -> None:
-    """scan, then backport every Approved item that has a clone dir; problems go to the item's Note."""
+    """scan, then backport every Not started item with Decision Approved that has a clone dir."""
     scan(gh, config, None)
     project = open_project(gh, config)
     versions = project_versions(project, config)
@@ -466,7 +490,7 @@ def cmd_run(args, gh: Github, config: Config) -> None:
     use_ai = config.run_ai and not args.no_ai
     approved: dict[str, list[Item]] = defaultdict(list)
     for item in tracked_items(project):
-        if item.status == APPROVED:
+        if item.status == NOT_STARTED and item.decision == APPROVED:
             approved[item.source_pr].append(item)
     if not approved:
         print("\nNothing approved to run.")
@@ -610,7 +634,7 @@ def main() -> None:
     p.set_defaults(func=cmd_start)
 
     p = sub.add_parser(
-        "run", parents=[with_dirs], help="scan, then backport every item whose Status is Approved",
+        "run", parents=[with_dirs], help="scan, then backport every Not started item whose Decision is Approved",
     )
     p.add_argument("--no-ai", action="store_true", help="Don't use AI for conflicts (default: [run] ai in config)")
     p.set_defaults(func=cmd_run)

@@ -19,30 +19,46 @@ F_REQUESTED = "Requested"
 F_STATUS = "Status"
 F_BACKPORT_PR = "Backport PR"
 F_NOTE = "Note"
+F_DECISION = "Decision"
+F_REQUESTED_BY = "Requested by"
 
 NOT_STARTED = "Not started"
-APPROVED = "Approved"
 CONFLICTS = "Conflicts"
 PR_OPEN = "PR open"
 MERGED = "Merged"
 CLOSED = "Closed"
 PRESENT = "Already present"
 NOT_APPLICABLE = "Not applicable"
+
+# Decision is set by people in the web page; empty means undecided.
+APPROVED = "Approved"
 DISCARDED = "Discarded"
 
 EXPLICIT = "explicit"
 IMPLIED = "implied"
 
 STATUS_COLORS = {
-    NOT_STARTED: "GRAY", APPROVED: "BLUE", CONFLICTS: "RED", PR_OPEN: "YELLOW", MERGED: "GREEN", CLOSED: "PURPLE",
-    PRESENT: "GREEN", NOT_APPLICABLE: "GRAY", DISCARDED: "GRAY",
+    NOT_STARTED: "GRAY", CONFLICTS: "RED", PR_OPEN: "YELLOW", MERGED: "GREEN", CLOSED: "PURPLE",
+    PRESENT: "GREEN", NOT_APPLICABLE: "GRAY",
 }
 # Statuses the backporter never changes again.
-FINAL_STATUSES = (MERGED, CLOSED, PRESENT, NOT_APPLICABLE, DISCARDED)
+FINAL_STATUSES = (MERGED, CLOSED, PRESENT, NOT_APPLICABLE)
+DECISION_COLORS = {APPROVED: "BLUE", DISCARDED: "GRAY"}
+
+# Columns (cards, for boards) the backporter makes visible; views created via the API show only defaults.
+# Column order can't be set via the API: it follows field creation order.
+_TABLE_FIELDS = [F_DECISION, F_STATUS, F_VERSION, F_REQUESTED, F_REQUESTED_BY, F_BACKPORT_PR, F_NOTE]
+_REQUESTS_FIELDS = [F_VERSION, F_NOTE]
+_BOARD_FIELDS = [F_VERSION, F_DECISION]
+REQUESTS_VIEW = "Requests"
+# Built-in columns that are always empty for draft items (in Requests also Status, and Source PR: the row is the PR).
+_HIDDEN_FIELDS = {"Assignees", "Linked pull requests", "Sub-issues progress"}
 FLAVOR_COLORS = {"stable": "BLUE", "antalya": "ORANGE"}
 REQUESTED_COLORS = {EXPLICIT: "GREEN", IMPLIED: "GRAY"}
 
-_OWN_FIELDS = {F_SOURCE_PR, F_VERSION, F_FLAVOR, F_REQUESTED, F_STATUS, F_BACKPORT_PR, F_NOTE}
+_OWN_FIELDS = {
+    F_SOURCE_PR, F_VERSION, F_FLAVOR, F_REQUESTED, F_STATUS, F_BACKPORT_PR, F_NOTE, F_DECISION, F_REQUESTED_BY,
+}
 _CUSTOM_FIELD_TYPES = {"TEXT", "SINGLE_SELECT", "MULTI_SELECT", "NUMBER", "DATE", "ITERATION"}
 
 _FIELDS_QUERY = """
@@ -55,7 +71,9 @@ query($id: ID!) {
           ... on ProjectV2SingleSelectField { options { id name color description } }
         }
       }
-      views(first: 50) { nodes { id name filter } }
+      views(first: 50) {
+        nodes { id number name filter layout fields(first: 50) { nodes { ... on ProjectV2FieldCommon { id name } } } }
+      }
       items(first: 1) { totalCount }
     }
   }
@@ -70,6 +88,7 @@ query($id: ID!, $after: String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
+          creator { login }
           content {
             ... on DraftIssue { title body }
             ... on PullRequest { title url }
@@ -101,6 +120,10 @@ class Item:
     status: str
     backport_pr: str
     note: str
+    decision: str
+    requested_by: str
+    # Who added the item to the project
+    creator: str
 
 
 def _version_filter(key: str) -> str:
@@ -153,22 +176,29 @@ class Project:
                     f"Project is not empty ({self.item_count} items, custom fields: {', '.join(foreign) or 'none'}) "
                     "and is not a backporter project; refusing to change it"
                 )
-        # Source PR goes first: its presence marks the project as formatted.
-        for name in (F_SOURCE_PR, F_BACKPORT_PR, F_NOTE):
+        # Columns follow field creation order, so the fields people use come first. Version needs at least
+        # one option, so the first add-version creates it. Source PR goes last: it marks the project as formatted.
+        self._ensure_single_select(F_DECISION, DECISION_COLORS, exact=False)
+        for name in (F_BACKPORT_PR, F_NOTE):
             if name not in self.fields:
                 self._create_field(name, "TEXT")
-        self._ensure_single_select(F_FLAVOR, FLAVOR_COLORS, exact=False)
         self._ensure_single_select(F_REQUESTED, REQUESTED_COLORS, exact=False)
+        if F_REQUESTED_BY not in self.fields:
+            self._create_field(F_REQUESTED_BY, "TEXT")
+        self._ensure_single_select(F_FLAVOR, FLAVOR_COLORS, exact=False)
+        if F_SOURCE_PR not in self.fields:
+            self._create_field(F_SOURCE_PR, "TEXT")
         # The built-in Status field comes with Todo/In Progress/Done; replace them with ours.
         self._ensure_single_select(F_STATUS, STATUS_COLORS, exact=True)
         self._load_fields()
+        self._ensure_requests_first()
         if "All" not in self.views:
             self._create_view("All", "BOARD_LAYOUT", None)
-        if "Requests" not in self.views:
-            self._create_view("Requests", "TABLE_LAYOUT", "no:requested")
         for key in self.version_keys():
             if key not in self.views:
                 self._create_view(key, "TABLE_LAYOUT", _version_filter(key))
+        self._load_fields()
+        self._show_fields()
 
     def is_formatted(self) -> bool:
         return F_SOURCE_PR in self.fields
@@ -188,6 +218,7 @@ class Project:
         if version.key not in self.views:
             self._create_view(version.key, "TABLE_LAYOUT", _version_filter(version.key))
         self._load_fields()
+        self._show_fields()
 
     def _create_field(self, name: str, data_type: str, options: list[dict] | None = None) -> None:
         payload = {"projectId": self.id, "dataType": data_type, "name": name}
@@ -220,6 +251,56 @@ class Project:
         else:
             options = [*field["options"], *(o for o in wanted if o["name"] not in existing)]
         self._update_options(field, options)
+
+    def _ensure_requests_first(self) -> None:
+        """
+        Make Requests the first view, which is the one a project opens with. Views can't be reordered via the
+        API, so GitHub's untouched default first view ("View 1") is turned into Requests.
+        """
+        first = min(self.views.values(), key=lambda v: v["number"])
+        if first["name"] == REQUESTS_VIEW:
+            return
+        if first["name"] == "View 1" and not first["filter"]:
+            if REQUESTS_VIEW in self.views:
+                self.requester.graphql_named_mutation(
+                    "deleteProjectV2View", {"viewId": self.views[REQUESTS_VIEW]["id"]}, "clientMutationId"
+                )
+            columns = [self.fields[n]["id"] for n in ("Title", *_REQUESTS_FIELDS) if n in self.fields]
+            self.requester.graphql_named_mutation(
+                "updateProjectV2View",
+                {
+                    "viewId": first["id"], "name": REQUESTS_VIEW, "layout": "TABLE_LAYOUT", "filter": "no:requested",
+                    "configuration": {"visibleFieldIds": columns},
+                },
+                "clientMutationId",
+            )
+            print(f"Turned the first view into '{REQUESTS_VIEW}'")
+        else:
+            if REQUESTS_VIEW not in self.views:
+                self._create_view(REQUESTS_VIEW, "TABLE_LAYOUT", "no:requested")
+            print(f"The first view is '{first['name']}'; drag the '{REQUESTS_VIEW}' tab to the front to open with it")
+        self._load_fields()
+
+    def _show_fields(self) -> None:
+        """Show the backporter's columns in every view and hide built-in ones that are empty for draft items."""
+        for view in self.views.values():
+            if view["name"] == REQUESTS_VIEW:
+                wanted = _REQUESTS_FIELDS
+            elif view["layout"] == "BOARD_LAYOUT":
+                wanted = _BOARD_FIELDS
+            else:
+                wanted = _TABLE_FIELDS
+            hidden = _HIDDEN_FIELDS | ({F_STATUS, F_SOURCE_PR} if view["name"] == REQUESTS_VIEW else set())
+            shown = [f for f in view["fields"]["nodes"] if f]
+            visible = [f["id"] for f in shown if f["name"] not in hidden]
+            missing = [self.fields[n]["id"] for n in wanted if n in self.fields and self.fields[n]["id"] not in visible]
+            if missing or len(visible) != len(shown):
+                self.requester.graphql_named_mutation(
+                    "updateProjectV2View",
+                    {"viewId": view["id"], "configuration": {"visibleFieldIds": visible + missing}},
+                    "clientMutationId",
+                )
+                print(f"Updated columns of view '{view['name']}'")
 
     def _create_view(self, name: str, layout: str, filter_: str | None) -> None:
         _, out = self.requester.graphql_named_mutation(
@@ -257,18 +338,23 @@ class Project:
                     status=values.get(F_STATUS, ""),
                     backport_pr=values.get(F_BACKPORT_PR, ""),
                     note=values.get(F_NOTE, ""),
+                    decision=values.get(F_DECISION, ""),
+                    requested_by=values.get(F_REQUESTED_BY, ""),
+                    creator=(node.get("creator") or {}).get("login", ""),
                 ))
             if not page["pageInfo"]["hasNextPage"]:
                 return result
             after = page["pageInfo"]["endCursor"]
 
-    def add_item(self, title: str, body: str, values: dict[str, str]) -> None:
+    def add_item(self, title: str, body: str, values: dict[str, str]) -> str:
+        """Add a draft item with field values; returns its id."""
         _, out = self.requester.graphql_named_mutation(
             "addProjectV2DraftIssue", {"projectId": self.id, "title": title, "body": body}, "projectItem { id }"
         )
         item_id = out["projectItem"]["id"]
         for name, value in values.items():
             self.set_value(item_id, name, value)
+        return item_id
 
     def set_value(self, item_id: str, field_name: str, value: str) -> None:
         field = self.fields.get(field_name)
