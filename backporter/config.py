@@ -62,6 +62,15 @@ def find_version(versions: list[Version], key: str) -> Version:
 class Config:
     project_owner: str
     project_number: int
+    # "all", a flavor, or a version key -> labels for backport PRs
+    labels: dict[str, list[str]]
+    # version key -> branch in TARGET_REPO
+    branches: dict[str, str]
+
+    def labels_for(self, version: Version) -> list[str]:
+        """Labels for a backport PR into version: 'all', then its flavor's, then its own."""
+        names = [*self.labels.get("all", []), *self.labels.get(version.flavor, []), *self.labels.get(version.key, [])]
+        return list(dict.fromkeys(names))
 
 
 def load_dotenv() -> None:
@@ -84,7 +93,16 @@ def load_dotenv() -> None:
 def load_config(path: str = CONFIG_PATH) -> Config:
     with open(path, "rb") as f:
         data = tomllib.load(f)
-    return Config(data.get("project_owner", ""), data.get("project_number", 0))
+    labels = data.get("labels", {})
+    for key, names in labels.items():
+        if not isinstance(names, list) or not all(isinstance(n, str) and n for n in names):
+            raise ValueError(f"{path}: labels.{key} must be a list of label names")
+    branches = data.get("branches", {})
+    for key, branch in branches.items():
+        Version.parse(key, branch)
+        if not isinstance(branch, str) or not branch:
+            raise ValueError(f"{path}: branches.{key} must be a branch name")
+    return Config(data.get("project_owner", ""), data.get("project_number", 0), labels, branches)
 
 
 def save_project(owner: str, number: int, path: str = CONFIG_PATH) -> None:

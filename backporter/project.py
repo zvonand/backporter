@@ -3,7 +3,7 @@ GitHub Projects v2 storage for backport items (GraphQL via PyGithub's requester)
 
 Each tracked item is a draft issue for one (source PR, version) pair.
 Items without a Requested value are requests added by hand in the web UI.
-Versions are the options of the Version field; each option's description is its branch.
+Versions are the options of the Version field; their branches come from the config.
 """
 
 from dataclasses import dataclass
@@ -99,8 +99,8 @@ class Item:
     note: str
 
 
-def _version_filter(version: Version) -> str:
-    return f'version:"{version.key}"'
+def _version_filter(key: str) -> str:
+    return f'version:"{key}"'
 
 
 class Project:
@@ -162,29 +162,27 @@ class Project:
             self._create_view("All", "BOARD_LAYOUT", None)
         if "Requests" not in self.views:
             self._create_view("Requests", "TABLE_LAYOUT", "no:requested")
-        for v in self.versions():
-            if v.key not in self.views:
-                self._create_view(v.key, "TABLE_LAYOUT", _version_filter(v))
+        for key in self.version_keys():
+            if key not in self.views:
+                self._create_view(key, "TABLE_LAYOUT", _version_filter(key))
 
     def is_formatted(self) -> bool:
         return F_SOURCE_PR in self.fields
 
-    def versions(self) -> list[Version]:
+    def version_keys(self) -> list[str]:
         field = self.fields.get(F_VERSION)
-        if field is None:
-            return []
-        return [Version.parse(o["name"], o["description"]) for o in field["options"]]
+        return [o["name"] for o in field["options"]] if field else []
 
     def add_version(self, version: Version) -> None:
         """Add a Version option and its view."""
-        option = {"name": version.key, "color": FLAVOR_COLORS[version.flavor], "description": version.branch}
+        option = {"name": version.key, "color": FLAVOR_COLORS[version.flavor], "description": ""}
         field = self.fields.get(F_VERSION)
         if field is None:
             self._create_field(F_VERSION, "SINGLE_SELECT", [option])
         else:
             self._update_options(field, [*field["options"], option])
         if version.key not in self.views:
-            self._create_view(version.key, "TABLE_LAYOUT", _version_filter(version))
+            self._create_view(version.key, "TABLE_LAYOUT", _version_filter(version.key))
         self._load_fields()
 
     def _create_field(self, name: str, data_type: str, options: list[dict] | None = None) -> None:

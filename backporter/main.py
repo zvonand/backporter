@@ -61,6 +61,15 @@ def tracked_items(project: Project) -> list[Item]:
     return [i for i in project.items() if i.requested]
 
 
+def project_versions(project: Project, config: Config) -> list[Version]:
+    """The project's versions with their branches from the config."""
+    keys = project.version_keys()
+    missing = [k for k in keys if k not in config.branches]
+    if missing:
+        raise RuntimeError(f"No branch for {', '.join(missing)}; add it to [branches] in {CONFIG_PATH}")
+    return [Version.parse(k, config.branches[k]) for k in keys]
+
+
 def pr_items(project: Project, url: str) -> dict[str, Item]:
     """Version key -> item for one source PR."""
     return {i.version: i for i in tracked_items(project) if i.source_pr == url}
@@ -96,12 +105,14 @@ def cmd_init(args, gh: Github, config: Config) -> None:
 
 def cmd_add_version(args, gh: Github, config: Config) -> None:
     project = open_project(gh, config)
-    existing = {v.key for v in project.versions()}
+    existing = set(project.version_keys())
     repo = gh.get_repo(TARGET_REPO)
-    branches = {"stable": args.stable_branch, "antalya": args.antalya_branch}
     new: list[Version] = []
     for flavor in FLAVORS if args.flavor == "both" else (args.flavor,):
-        version = Version.make(flavor, args.version, branches[flavor] or f"{flavor}-{args.version}")
+        key = f"{flavor}-{args.version}"
+        if key not in config.branches:
+            raise RuntimeError(f"No branch for {key}; add it to [branches] in {CONFIG_PATH} first")
+        version = Version.make(flavor, args.version, config.branches[key])
         if version.key in existing:
             raise RuntimeError(f"Version {version.key} already exists")
         try:
@@ -114,7 +125,7 @@ def cmd_add_version(args, gh: Github, config: Config) -> None:
         print(f"Added version {version.key} (branch {version.branch})")
 
     # Backfill: tracked PRs whose explicit requests now imply a new version.
-    versions = project.versions()
+    versions = project_versions(project, config)
     keys = {v.key for v in versions}
     by_pr: dict[str, list[Item]] = defaultdict(list)
     for item in tracked_items(project):
@@ -132,11 +143,11 @@ def cmd_add_version(args, gh: Github, config: Config) -> None:
                 create_item(project, version, url, title, IMPLIED)
 
 
-def track(gh: Github, project: Project, pr_url: str, version_key: str) -> None:
+def track(gh: Github, project: Project, config: Config, pr_url: str, version_key: str) -> None:
     """Track a backport of pr_url to version_key (explicit) and every version it implies."""
     pr_repo, number = git_ops.parse_pr_url(pr_url)
     url = source_url(pr_repo, number)
-    versions = project.versions()
+    versions = project_versions(project, config)
     target = find_version(versions, version_key)
     pr = gh.get_repo(pr_repo).get_pull(number)
     existing = pr_items(project, url)
@@ -152,16 +163,16 @@ def track(gh: Github, project: Project, pr_url: str, version_key: str) -> None:
 
 
 def cmd_add(args, gh: Github, config: Config) -> None:
-    track(gh, open_project(gh, config), args.pr, args.version)
+    track(gh, open_project(gh, config), config, args.pr, args.version)
 
 
-def process_requests(gh: Github, project: Project) -> None:
+def process_requests(gh: Github, project: Project, config: Config) -> None:
     """
     Turn items added by hand in the web UI into tracked items, then delete them.
     The PR URL comes from the Source PR field, a linked PR, the title or the body;
     versions come from the Version field and from version keys in the title or body.
     """
-    keys = {v.key for v in project.versions()}
+    keys = set(project.version_keys())
     for item in project.items():
         if item.requested:
             continue
@@ -189,7 +200,7 @@ def process_requests(gh: Github, project: Project) -> None:
         url = source_url(pr_repo, number)
         print(f"Request '{item.title}': {url} -> {', '.join(dict.fromkeys(requested))}")
         for key in dict.fromkeys(requested):
-            track(gh, project, url, key)
+            track(gh, project, config, url, key)
         project.delete_item(item.id)
 
 
@@ -197,7 +208,7 @@ def cmd_remove(args, gh: Github, config: Config) -> None:
     pr_repo, number = git_ops.parse_pr_url(args.pr)
     url = source_url(pr_repo, number)
     project = open_project(gh, config)
-    versions = project.versions()
+    versions = project_versions(project, config)
     target = find_version(versions, args.version)
     items = pr_items(project, url)
     other_explicit = [
@@ -222,8 +233,8 @@ def find_backport_pr(repo: Repository, item: Item, version: Version) -> PullRequ
 
 def cmd_scan(args, gh: Github, config: Config) -> None:
     project = open_project(gh, config)
-    process_requests(gh, project)
-    version_list = project.versions()
+    process_requests(gh, project, config)
+    version_list = project_versions(project, config)
     if args.version:
         find_version(version_list, args.version)
     versions = {v.key: v for v in version_list}
@@ -295,6 +306,9 @@ def finish_backport(
             title=f"{version.label} Backport of #{pr.number} - {pr.title}",
             body=body,
         )
+    labels = config.labels_for(version)
+    if labels:
+        backport.add_to_labels(*labels)
     project.set_value(item.id, F_BACKPORT_PR, backport.html_url)
     project.set_value(item.id, F_STATUS, PR_OPEN)
     print(f"{version.key}: {backport.html_url}")
@@ -365,13 +379,27 @@ def resolve_with_ai(
     return False
 
 
+def check_labels(gh: Github, config: Config, versions: list[Version]) -> None:
+    """Fail early if a configured label does not exist in TARGET_REPO (labels are never created)."""
+    repo = gh.get_repo(TARGET_REPO)
+    names = dict.fromkeys(n for v in versions for n in config.labels_for(v))
+    missing = []
+    for name in names:
+        try:
+            repo.get_label(name)
+        except GithubException:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(f"Labels not found in {TARGET_REPO}: {', '.join(missing)}; fix [labels] in {CONFIG_PATH}")
+
+
 def cmd_start(args, gh: Github, config: Config) -> None:
     pr_repo, number = git_ops.parse_pr_url(args.pr)
     url = source_url(pr_repo, number)
     pr = gh.get_repo(pr_repo).get_pull(number)
     merge_sha = git_ops.get_merge_commit_sha(pr)
     project = open_project(gh, config)
-    versions = project.versions()
+    versions = project_versions(project, config)
     items = pr_items(project, url)
     if args.versions:
         targets = [find_version(versions, k) for k in args.versions]
@@ -390,6 +418,7 @@ def cmd_start(args, gh: Github, config: Config) -> None:
     for v in targets:
         git_ops.check_repo_dir(dirs[v.key])
         git_ops.check_origin(dirs[v.key], TARGET_REPO)
+    check_labels(gh, config, targets)
 
     for v in sort_versions(targets):
         item = items[v.key]
@@ -416,7 +445,7 @@ def cmd_continue(args, gh: Github, config: Config) -> None:
     pr_repo, number = git_ops.parse_pr_url(args.pr)
     url = source_url(pr_repo, number)
     project = open_project(gh, config)
-    versions = project.versions()
+    versions = project_versions(project, config)
     version = find_version(versions, args.version)
     item = pr_items(project, url).get(version.key)
     if item is None:
@@ -426,6 +455,7 @@ def cmd_continue(args, gh: Github, config: Config) -> None:
         raise RuntimeError(f"No clone dir for {version.key}; pass -C KEY=DIR or set it in the dirs file")
     pr = gh.get_repo(pr_repo).get_pull(number)
     repo_dir = dirs[version.key]
+    check_labels(gh, config, [version])
     if args.ai:
         git_ops.check_repo_dir(repo_dir)
         git_ops.check_origin(repo_dir, TARGET_REPO)
@@ -446,7 +476,7 @@ def cmd_mark(args, gh: Github, config: Config) -> None:
     pr_repo, number = git_ops.parse_pr_url(args.pr)
     url = source_url(pr_repo, number)
     project = open_project(gh, config)
-    versions = project.versions()
+    versions = project_versions(project, config)
     version = find_version(versions, args.version)
     item = pr_items(project, url).get(version.key)
     if item is None:
@@ -496,11 +526,9 @@ def main() -> None:
     p.add_argument("url", help="Project URL, e.g. https://github.com/orgs/Altinity/projects/N")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("add-version", parents=[common], help="Add a ClickHouse version to the project")
+    p = sub.add_parser("add-version", parents=[common], help="Add a ClickHouse version (its branch must be in [branches] of the config)")
     p.add_argument("version", help="X.Y, e.g. 27.3")
     p.add_argument("--flavor", required=True, choices=[*FLAVORS, "both"])
-    p.add_argument("--stable-branch", help="Branch of the stable version (default: stable-X.Y)")
-    p.add_argument("--antalya-branch", help="Branch of the antalya version (default: antalya-X.Y)")
     p.set_defaults(func=cmd_add_version)
 
     p = sub.add_parser("add", parents=[common], help="Track a backport to a version and all versions it implies")

@@ -1,3 +1,24 @@
 # Set by `backporter init <project URL>`.
 project_owner = "Altinity"
 project_number = 38
+
+# Branch in Altinity/ClickHouse for each version key (<flavor>-X.Y).
+# Every version in the project needs an entry; add it here before `backporter add-version`.
+[branches]
+"stable-25.3" = "releases/25.3.14"
+"stable-25.8" = "stable-25.8"
+"stable-26.3" = "stable-26.3"
+"stable-26.8" = "stable-26.8"
+"antalya-25.8" = "antalya-25.8"
+"antalya-26.3" = "antalya-26.3"
+"antalya-26.6" = "antalya-26.6"
+"antalya-26.8" = "antalya-26.8"
+
+# Labels added to every backport PR the backporter opens. They must already exist in Altinity/ClickHouse.
+[labels]
+all = ["backport"]
+# Extra labels by flavor:
+# stable = ["stable"]
+# antalya = ["antalya"]
+# Extra labels by version key:
+# "antalya-25.8" = ["antalya-25.8"]

@@ -3,6 +3,7 @@ Allowlist for every GitHub API request the backporter makes.
 
 Reads (GET/HEAD) are allowed. The only allowed writes are:
 - opening a PR in TARGET_REPO (POST /repos/<TARGET_REPO>/pulls);
+- adding labels to a PR/issue in TARGET_REPO (POST /repos/<TARGET_REPO>/issues/<n>/labels);
 - the GraphQL mutations used to maintain the project.
 Everything else is refused before it is sent, in particular any comment, review, issue or
 edit anywhere, and any write to ClickHouse/ClickHouse.
@@ -60,6 +61,8 @@ def check_request(verb: str, url: str, body: object) -> None:
         return
     path = urllib.parse.urlparse(url).path.rstrip("/")
     if verb == "POST" and path.lower() == f"/repos/{TARGET_REPO}/pulls".lower():
+        return
+    if verb == "POST" and re.fullmatch(rf"/repos/{re.escape(TARGET_REPO)}/issues/\d+/labels", path, re.IGNORECASE):
         return
     if verb == "POST" and path.endswith("/graphql"):
         query = json.loads(body)["query"] if isinstance(body, (str, bytes)) else ""
