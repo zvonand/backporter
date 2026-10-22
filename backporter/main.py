@@ -255,7 +255,9 @@ def cmd_scan(args, gh: Github, config: Config) -> None:
 
 def scan(gh: Github, config: Config, only_version: str | None) -> None:
     """Process web requests, refresh statuses from GitHub, report pending and missing items."""
+    print(f"Reading project {config.project_owner}#{config.project_number}...", flush=True)
     project = open_project(gh, config)
+    print("Processing requests...", flush=True)
     created = process_requests(gh, project, config)
     version_list = project_versions(project, config)
     if only_version:
@@ -266,12 +268,15 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
     listed = {i.id for i in items}
     items += [i for i in created if i.id not in listed]
 
-    for item in items:
-        version = versions.get(item.version)
-        if item.status in FINAL_STATUSES or item.decision == DISCARDED or version is None:
-            continue
-        if only_version and item.version != only_version:
-            continue
+    to_refresh = [
+        i for i in items
+        if i.status not in FINAL_STATUSES and i.decision != DISCARDED and i.version in versions
+        and (not only_version or i.version == only_version)
+    ]
+    print(f"Refreshing {len(to_refresh)} item(s) from GitHub...", flush=True)
+    for n, item in enumerate(to_refresh, 1):
+        version = versions[item.version]
+        print(f"  [{n}/{len(to_refresh)}] {item.version} {item.source_pr}", flush=True)
         pr = find_backport_pr(repo, item, version)
         if pr is None:
             continue
@@ -281,7 +286,7 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
             item.backport_pr = pr.html_url
         if status != item.status:
             project.set_value(item.id, F_STATUS, status)
-            print(f"{item.version}: {item.source_pr} {item.status} -> {status}")
+            print(f"    {item.status} -> {status} ({pr.html_url})", flush=True)
             item.status = status
 
     pending: dict[str, list[Item]] = defaultdict(list)
@@ -325,7 +330,9 @@ def finish_backport(
     existing = list(repo.get_pulls(state="open", head=f"{owner}:{branch}"))
     if existing:
         backport = existing[0]
+        print(f"Reusing open PR {backport.html_url}")
     else:
+        print(f"Opening PR {branch} -> {version.branch} in {TARGET_REPO}...")
         body = f"Backport of {pr.html_url}\n\n{changelog(pr)}".strip()
         backport = repo.create_pull(
             base=version.branch,
@@ -335,7 +342,9 @@ def finish_backport(
         )
     labels = config.labels_for(version)
     if labels:
+        print(f"Adding labels: {', '.join(labels)}")
         backport.add_to_labels(*labels)
+    print("Updating the project...")
     project.set_value(item.id, F_BACKPORT_PR, backport.html_url)
     project.set_value(item.id, F_STATUS, PR_OPEN)
     print(f"{version.key}: {backport.html_url}")
@@ -495,9 +504,11 @@ def cmd_run(args, gh: Github, config: Config) -> None:
     if not approved:
         print("\nNothing approved to run.")
         return
+    count = sum(len(its) for its in approved.values())
+    print(f"\nApproved: {count} item(s) in {len(approved)} PR(s); AI for conflicts: {'on' if use_ai else 'off'}")
     failed = False
-    for url, its in approved.items():
-        print(f"\n##### {url}")
+    for n, (url, its) in enumerate(approved.items(), 1):
+        print(f"\n##### [{n}/{len(approved)}] {url}: {', '.join(i.version for i in its)}")
         targets = [v for v in versions if v.key in {i.version for i in its}]
         no_dir = [v.key for v in targets if v.key not in dirs]
         if no_dir:
@@ -585,6 +596,8 @@ def cmd_describe(args, gh: Github, config: Config) -> None:
 
 
 def main() -> None:
+    # Show progress immediately even when output goes to a pipe or a log file.
+    sys.stdout.reconfigure(line_buffering=True)
     load_dotenv()
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(

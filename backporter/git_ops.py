@@ -10,8 +10,17 @@ import sys
 from github.PullRequest import PullRequest
 
 
-def run(cmd: list[str], cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    """Run a command and return the result."""
+def run(cmd: list[str], cwd: str | None = None, check: bool = True, stream: bool = False) -> subprocess.CompletedProcess:
+    """
+    Run a command and return the result. With stream, print the command and let its output (e.g. git's
+    progress) go straight to the terminal; for long operations like fetch and push.
+    """
+    if stream:
+        print(f"$ {' '.join(cmd)}", flush=True)
+        result = subprocess.run(cmd, cwd=cwd, text=True)
+        if check and result.returncode != 0:
+            raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+        return result
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if check and result.returncode != 0:
         print(result.stderr, file=sys.stderr)
@@ -144,7 +153,7 @@ def cherry_pick(
     check_repo_dir(repo_dir)
     check_origin(repo_dir, target_repo)
     print(f"Fetching latest {target_branch} from {target_repo}...")
-    run(["git", "fetch", "origin", target_branch], cwd=repo_dir)
+    run(["git", "fetch", "origin", target_branch], cwd=repo_dir, stream=True)
     co_result = run_no_check(["git", "checkout", target_branch], cwd=repo_dir)
     if co_result.returncode != 0 and is_unresolved_state(co_result.stderr):
         print(co_result.stderr, file=sys.stderr)
@@ -152,13 +161,13 @@ def cherry_pick(
             raise RuntimeError("Aborted; repo left as is")
         run_no_check(["git", "cherry-pick", "--abort"], cwd=repo_dir)
         run(["git", "checkout", target_branch], cwd=repo_dir)
-        run(["git", "pull", "origin", target_branch], cwd=repo_dir)
+        run(["git", "pull", "origin", target_branch], cwd=repo_dir, stream=True)
         run_no_check(["git", "branch", "-D", backport_branch], cwd=repo_dir)
     else:
         if co_result.returncode != 0:
             print(co_result.stderr, file=sys.stderr)
             raise RuntimeError(f"Command failed: git checkout {target_branch}")
-        run(["git", "pull", "origin", target_branch], cwd=repo_dir)
+        run(["git", "pull", "origin", target_branch], cwd=repo_dir, stream=True)
 
     if branch_exists(repo_dir, backport_branch):
         if not prompt_yes_no(f"Branch '{backport_branch}' already exists. Delete and recreate from clean target?"):
@@ -170,14 +179,14 @@ def cherry_pick(
 
     # The repo where the PR was merged is upstream of the target fork
     if target_repo == pr_repo:
-        run(["git", "fetch", "origin", merge_sha], cwd=repo_dir)
+        run(["git", "fetch", "origin", merge_sha], cwd=repo_dir, stream=True)
     else:
         pr_fetch_url = f"https://github.com/{pr_repo}.git"
         result = run_no_check(["git", "remote", "add", "upstream", pr_fetch_url], cwd=repo_dir)
         if result.returncode != 0 and "already exists" in result.stderr:
             run(["git", "remote", "set-url", "upstream", pr_fetch_url], cwd=repo_dir)
         print(f"Fetching from upstream ({pr_repo})...")
-        run(["git", "fetch", "upstream", merge_sha], cwd=repo_dir)
+        run(["git", "fetch", "upstream", merge_sha], cwd=repo_dir, stream=True)
 
     print("Cherry-picking merge commit...")
     cp_result = run_no_check(["git", "cherry-pick", "-m", "1", merge_sha, "--no-edit"], cwd=repo_dir)
@@ -260,4 +269,4 @@ def continue_cherry_pick(repo_dir: str, backport_branch: str) -> str:
 def push(repo_dir: str, branch: str, target_repo: str) -> None:
     check_origin(repo_dir, target_repo)
     print(f"Pushing {branch} to {target_repo}...")
-    run(["git", "push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo_dir)
+    run(["git", "push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo_dir, stream=True)

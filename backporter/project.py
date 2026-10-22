@@ -6,6 +6,8 @@ Items without a Requested value are requests added by hand in the web UI.
 Versions are the options of the Version field; their branches come from the config.
 """
 
+import sys
+import time
 from dataclasses import dataclass
 
 from github.Requester import Requester
@@ -61,6 +63,11 @@ _OWN_FIELDS = {
 }
 _CUSTOM_FIELD_TYPES = {"TEXT", "SINGLE_SELECT", "MULTI_SELECT", "NUMBER", "DATE", "ITERATION"}
 
+# GitHub sometimes answers project queries with an empty result (seen with totalCount 0 for a project
+# with items), so empty answers are re-read a few times before being trusted.
+_READ_ATTEMPTS = 5
+_RETRY_SECONDS = 3
+
 _FIELDS_QUERY = """
 query($id: ID!) {
   node(id: $id) {
@@ -74,7 +81,6 @@ query($id: ID!) {
       views(first: 50) {
         nodes { id number name filter layout fields(first: 50) { nodes { ... on ProjectV2FieldCommon { id name } } } }
       }
-      items(first: 1) { totalCount }
     }
   }
 }
@@ -136,7 +142,6 @@ class Project:
         self.id = project_id
         self.fields: dict[str, dict] = {}
         self.views: dict[str, dict] = {}
-        self.item_count = 0
         self._load_fields()
 
     @classmethod
@@ -153,11 +158,18 @@ class Project:
         return cls(requester, project["id"])
 
     def _load_fields(self) -> None:
-        _, data = self.requester.graphql_query(_FIELDS_QUERY, {"id": self.id})
-        node = data["data"]["node"]
+        for attempt in range(_READ_ATTEMPTS):
+            _, data = self.requester.graphql_query(_FIELDS_QUERY, {"id": self.id})
+            node = data["data"]["node"]
+            # Every project has a Title field and at least one view.
+            if any(f and f.get("name") == "Title" for f in node["fields"]["nodes"]) and node["views"]["nodes"]:
+                break
+            print("GitHub returned an incomplete project schema; retrying...", file=sys.stderr)
+            time.sleep(_RETRY_SECONDS)
+        else:
+            raise RuntimeError("GitHub keeps returning an incomplete project schema; try again later")
         self.fields = {f["name"]: f for f in node["fields"]["nodes"] if f}
         self.views = {v["name"]: v for v in node["views"]["nodes"]}
-        self.item_count = node["items"]["totalCount"]
 
     # --- schema ---
 
@@ -171,9 +183,10 @@ class Project:
                 name for name, f in self.fields.items()
                 if f["dataType"] in _CUSTOM_FIELD_TYPES and name not in _OWN_FIELDS
             ]
-            if self.item_count or foreign:
+            item_count = len(self.items())
+            if item_count or foreign:
                 raise RuntimeError(
-                    f"Project is not empty ({self.item_count} items, custom fields: {', '.join(foreign) or 'none'}) "
+                    f"Project is not empty ({item_count} items, custom fields: {', '.join(foreign) or 'none'}) "
                     "and is not a backporter project; refusing to change it"
                 )
         # Columns follow field creation order, so the fields people use come first. Version needs at least
@@ -315,6 +328,16 @@ class Project:
     # --- items ---
 
     def items(self) -> list[Item]:
+        for attempt in range(_READ_ATTEMPTS):
+            result = self._read_items()
+            if result:
+                return result
+            if attempt < _READ_ATTEMPTS - 1:
+                print("GitHub returned no project items; re-checking...", file=sys.stderr)
+                time.sleep(_RETRY_SECONDS)
+        return []
+
+    def _read_items(self) -> list[Item]:
         result: list[Item] = []
         after = None
         while True:
