@@ -14,6 +14,10 @@ project_number = 38
 "antalya-26.6" = "antalya-26.6"
 "antalya-26.8" = "antalya-26.8"
 
+[run]
+# AI conflict resolution in `backporter run` (`--no-ai` turns it off for one run).
+ai = true
+
 # Labels added to every backport PR the backporter opens. They must already exist in Altinity/ClickHouse.
 [labels]
 all = ["backport"]

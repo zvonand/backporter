@@ -40,11 +40,26 @@ backporter add https://github.com/ClickHouse/ClickHouse/pull/109551 stable-25.8
 
 This creates the items immediately. To undo it, run `backporter remove <PR> <version>` (see [`remove`](#remove)).
 
-### What happens next
+### Deciding what gets done (also from the web page)
 
-- `backporter start <PR>` does the backport into each `Not started` version: it cherry-picks, pushes, and opens a labeled PR in `Altinity/ClickHouse`. With `--ai`, Claude resolves conflicts.
-- Each item's **Status**, **Backport PR** and **Note** show where it stands. Possible states are `Not started`, `Conflicts`, `PR open`, `Merged`, `Closed`, `Already present` and `Not applicable`, and `Note` explains the last two.
-- `backporter scan` refreshes the statuses from GitHub and lists what's still pending.
+New items start as **`Not started`**, which means waiting for a decision. Nothing is backported until someone decides. In any view, change the item's **Status** cell:
+
+- **`Approved`**: do it. The next `backporter run` backports it: cherry-pick, push, and a labeled PR in `Altinity/ClickHouse`. AI resolves conflicts by default.
+- **`Discarded`**: don't do it. The item stays as a record, and the backporter never touches it again.
+
+After that, Status, **Backport PR** and **Note** show the outcome:
+
+| Status | Meaning |
+|---|---|
+| `Not started` | waiting for a decision |
+| `Approved` | queued for the next `run` (`Note` says why, if a run couldn't do it) |
+| `Conflicts` | needs a human; `Note` has the AI's reason if it tried |
+| `PR open` / `Merged` / `Closed` | backport PR in `Backport PR` |
+| `Already present` | already in that branch; `Backport PR` names the PR that brought it, if found |
+| `Not applicable` | makes no sense for that version; `Note` says why |
+| `Discarded` | decided not to do it |
+
+`backporter scan` refreshes statuses from GitHub and lists what's still pending. To backport one PR right away without approving, run `backporter start <PR>`.
 
 ## Installation
 
@@ -92,6 +107,7 @@ The token is used for the GitHub API only. `git fetch`/`git push` in the clone d
 [`backporter/config.toml`](backporter/config.toml) is committed and shared by the team. It holds:
 
 - `project_owner`, `project_number`: the project, written by `backporter init <project-URL>`.
+- `[run]`: `ai = true` turns on AI conflict resolution by default in `backporter run`.
 - `[labels]`: labels added to every backport PR the backporter opens.
   - `all` applies to every PR.
   - A flavor (`stable`, `antalya`) adds labels for that flavor.
@@ -162,7 +178,7 @@ Each item is a draft issue for one (source PR, version) pair. It is titled `[<ve
 | Version | Version key, e.g. `stable-25.8` |
 | Flavor | `stable` / `antalya` |
 | Requested | `explicit` (named in `add`) or `implied` (required by the propagation rules) |
-| Status | `Not started`, `Conflicts`, `PR open`, `Merged`, `Closed`, `Already present`, `Not applicable` |
+| Status | `Not started`, `Approved`, `Conflicts`, `PR open`, `Merged`, `Closed`, `Already present`, `Not applicable`, `Discarded` (see [Deciding what gets done](#deciding-what-gets-done-also-from-the-web-page)) |
 | Backport PR | URL of the backport PR in `Altinity/ClickHouse`; for `Already present`, the PR that already brought the change (Altinity or ClickHouse) |
 | Note | One line explaining the outcome: why it is not applicable, which PR already brought it, what the AI adapted or why it gave up |
 
@@ -245,8 +261,8 @@ backporter scan [--version KEY]
 ```
 
 1. Processes requests added in the web page (see [Requesting a backport](#requesting-a-backport)): each requested version is handled like `add`, then the request row is deleted.
-2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>`, so backports opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`).
-3. Lists items still `Not started` or in `Conflicts`, grouped by version.
+2. Refreshes every item that is not `Merged`, `Closed`, `Already present`, `Not applicable` or `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>`, so backports opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`).
+3. Lists items still `Not started`, `Approved` or in `Conflicts`, grouped by version.
 4. Reports PRs that are missing versions implied by their explicit requests.
 
 `--version` limits steps 2 and 3 to one version.
@@ -257,7 +273,7 @@ backporter scan [--version KEY]
 backporter start <PR-URL> [<version> ...] [--ai]
 ```
 
-Backports a merged PR. Without versions it takes all of the PR's items with Status `Not started`; with versions it takes those (they must already be added, in any status). Every version needs a clone dir (see below). The versions are processed oldest first, and for each one, in its clone dir, it:
+Backports a merged PR right away. Running it counts as the decision, so no approval is needed. Without versions it takes all of the PR's items with Status `Not started` or `Approved`; with versions it takes those (they must already be added, in any status). Every version needs a clone dir (see below). The versions are processed oldest first, and for each one, in its clone dir, it:
 
 1. Fetches and checks out the target branch and pulls it.
 2. Creates `backports/<branch>/<N>`.
@@ -287,6 +303,25 @@ It then continues with the next version.
 | `UNRESOLVED` | Sets `Conflicts` with the AI's reason in `Note`, leaves the conflicts for a human, and stops. |
 
 If the backport branch already exists locally, or the clone is in a conflicted/dirty state, it asks before recreating the branch from a clean target. Answering no aborts.
+
+### `run`
+
+```bash
+backporter run [--no-ai]
+```
+
+The command for working through the project, by hand or on a schedule:
+1. Runs `scan`.
+2. Backports every item whose Status is `Approved`, grouped by source PR, oldest version first, the same way as `start`.
+
+AI conflict resolution is on by default. Set `[run] ai = false` in `config.toml` to turn it off, or pass `--no-ai` for one run.
+
+Unlike `start`, a problem doesn't stop the whole run:
+- An item whose version has no clone dir, or whose source PR isn't merged yet, is skipped and stays `Approved`.
+- An error (e.g. a misconfigured clone) is written to the item's `Note`, and the item stays `Approved` for the next run.
+- Unresolved conflicts set `Conflicts`.
+
+The run exits with code 1 if anything failed or needs a human.
 
 ### `continue`
 

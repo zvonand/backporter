@@ -21,20 +21,24 @@ F_BACKPORT_PR = "Backport PR"
 F_NOTE = "Note"
 
 NOT_STARTED = "Not started"
+APPROVED = "Approved"
 CONFLICTS = "Conflicts"
 PR_OPEN = "PR open"
 MERGED = "Merged"
 CLOSED = "Closed"
 PRESENT = "Already present"
 NOT_APPLICABLE = "Not applicable"
+DISCARDED = "Discarded"
 
 EXPLICIT = "explicit"
 IMPLIED = "implied"
 
 STATUS_COLORS = {
-    NOT_STARTED: "GRAY", CONFLICTS: "RED", PR_OPEN: "YELLOW", MERGED: "GREEN", CLOSED: "PURPLE",
-    PRESENT: "GREEN", NOT_APPLICABLE: "GRAY",
+    NOT_STARTED: "GRAY", APPROVED: "BLUE", CONFLICTS: "RED", PR_OPEN: "YELLOW", MERGED: "GREEN", CLOSED: "PURPLE",
+    PRESENT: "GREEN", NOT_APPLICABLE: "GRAY", DISCARDED: "GRAY",
 }
+# Statuses the backporter never changes again.
+FINAL_STATUSES = (MERGED, CLOSED, PRESENT, NOT_APPLICABLE, DISCARDED)
 FLAVOR_COLORS = {"stable": "BLUE", "antalya": "ORANGE"}
 REQUESTED_COLORS = {EXPLICIT: "GREEN", IMPLIED: "GRAY"}
 

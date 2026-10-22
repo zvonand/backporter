@@ -66,6 +66,8 @@ class Config:
     labels: dict[str, list[str]]
     # version key -> branch in TARGET_REPO
     branches: dict[str, str]
+    # AI conflict resolution in `backporter run`
+    run_ai: bool
 
     def labels_for(self, version: Version) -> list[str]:
         """Labels for a backport PR into version: 'all', then its flavor's, then its own."""
@@ -102,7 +104,10 @@ def load_config(path: str = CONFIG_PATH) -> Config:
         Version.parse(key, branch)
         if not isinstance(branch, str) or not branch:
             raise ValueError(f"{path}: branches.{key} must be a branch name")
-    return Config(data.get("project_owner", ""), data.get("project_number", 0), labels, branches)
+    run_ai = data.get("run", {}).get("ai", True)
+    if not isinstance(run_ai, bool):
+        raise ValueError(f"{path}: run.ai must be true or false")
+    return Config(data.get("project_owner", ""), data.get("project_number", 0), labels, branches, run_ai)
 
 
 def save_project(owner: str, number: int, path: str = CONFIG_PATH) -> None:

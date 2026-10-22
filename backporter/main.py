@@ -5,8 +5,9 @@ Backport tracker backed by a GitHub Project.
     backporter add-version X.Y --flavor F     add a version (stable, antalya or both) to the project
     backporter add <PR-URL> <version>         track a backport to version and every version it implies
     backporter remove <PR-URL> <version>      stop tracking version and what only it implied
-    backporter scan [--version KEY]           process web UI requests, refresh statuses, list backports not started
+    backporter scan [--version KEY]           process web UI requests, refresh statuses, list pending
     backporter start <PR-URL> [version ...]   cherry-pick, push, open backport PRs (--ai: AI resolves conflicts)
+    backporter run [--no-ai]                  scan, then backport everything set to Approved in the project
     backporter continue <PR-URL> <version>    finish after resolving conflicts (--ai: let AI resolve them)
     backporter mark <PR-URL> <version> present|not-applicable [--by URL] [--note TEXT]
     backporter describe <PR-URL>              print changelog description of a PR
@@ -31,7 +32,7 @@ from backporter.config import (
 )
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
-    IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
+    APPROVED, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -232,20 +233,25 @@ def find_backport_pr(repo: Repository, item: Item, version: Version) -> PullRequ
 
 
 def cmd_scan(args, gh: Github, config: Config) -> None:
+    scan(gh, config, args.version)
+
+
+def scan(gh: Github, config: Config, only_version: str | None) -> None:
+    """Process web requests, refresh statuses from GitHub, report pending and missing items."""
     project = open_project(gh, config)
     process_requests(gh, project, config)
     version_list = project_versions(project, config)
-    if args.version:
-        find_version(version_list, args.version)
+    if only_version:
+        find_version(version_list, only_version)
     versions = {v.key: v for v in version_list}
     repo = gh.get_repo(TARGET_REPO)
     items = tracked_items(project)
 
     for item in items:
         version = versions.get(item.version)
-        if item.status in (MERGED, CLOSED, PRESENT, NOT_APPLICABLE) or version is None:
+        if item.status in FINAL_STATUSES or version is None:
             continue
-        if args.version and item.version != args.version:
+        if only_version and item.version != only_version:
             continue
         pr = find_backport_pr(repo, item, version)
         if pr is None:
@@ -261,7 +267,7 @@ def cmd_scan(args, gh: Github, config: Config) -> None:
 
     pending: dict[str, list[Item]] = defaultdict(list)
     for item in items:
-        if item.status in (NOT_STARTED, CONFLICTS) and (not args.version or item.version == args.version):
+        if item.status in (NOT_STARTED, APPROVED, CONFLICTS) and (not only_version or item.version == only_version):
             pending[item.version].append(item)
     if not pending:
         print("No pending backports.")
@@ -393,28 +399,12 @@ def check_labels(gh: Github, config: Config, versions: list[Version]) -> None:
         raise RuntimeError(f"Labels not found in {TARGET_REPO}: {', '.join(missing)}; fix [labels] in {CONFIG_PATH}")
 
 
-def cmd_start(args, gh: Github, config: Config) -> None:
-    pr_repo, number = git_ops.parse_pr_url(args.pr)
-    url = source_url(pr_repo, number)
-    pr = gh.get_repo(pr_repo).get_pull(number)
+def backport(
+    gh: Github, project: Project, config: Config, pr: PullRequest, pr_repo: str, items: dict[str, Item],
+    targets: list[Version], dirs: dict[str, str], use_ai: bool,
+) -> bool:
+    """Backport pr into targets (each has a clone dir), oldest first. False if stopped at unresolved conflicts."""
     merge_sha = git_ops.get_merge_commit_sha(pr)
-    project = open_project(gh, config)
-    versions = project_versions(project, config)
-    items = pr_items(project, url)
-    if args.versions:
-        targets = [find_version(versions, k) for k in args.versions]
-        untracked = [v.key for v in targets if v.key not in items]
-        if untracked:
-            raise RuntimeError(f"Not tracked: {', '.join(untracked)}; run `backporter add` first")
-    else:
-        targets = [v for v in versions if v.key in items and items[v.key].status == NOT_STARTED]
-    if not targets:
-        print("Nothing to start.")
-        return
-    dirs = load_dirs(args.dirs, versions)
-    no_dir = [v.key for v in targets if v.key not in dirs]
-    if no_dir:
-        raise RuntimeError(f"No clone dir for {', '.join(no_dir)}; pass -C KEY=DIR or set it in the dirs file")
     for v in targets:
         git_ops.check_repo_dir(dirs[v.key])
         git_ops.check_origin(dirs[v.key], TARGET_REPO)
@@ -424,21 +414,89 @@ def cmd_start(args, gh: Github, config: Config) -> None:
         item = items[v.key]
         print(f"\n=== {v.key} ===")
         outcome, conflicts = git_ops.cherry_pick(
-            dirs[v.key], TARGET_REPO, v.branch, backport_branch(v, number), pr_repo, merge_sha
+            dirs[v.key], TARGET_REPO, v.branch, backport_branch(v, pr.number), pr_repo, merge_sha
         )
         if outcome == git_ops.EMPTY:
             record_present(gh, project, item, v, pr, pr_repo, dirs[v.key])
             continue
         if outcome == git_ops.CONFLICTS:
-            if args.ai and resolve_with_ai(gh, project, config, item, v, pr, pr_repo, dirs[v.key], conflicts):
+            if use_ai and resolve_with_ai(gh, project, config, item, v, pr, pr_repo, dirs[v.key], conflicts):
                 continue
             project.set_value(item.id, F_STATUS, CONFLICTS)
             print(f"\nConflicts in {len(conflicts)} file(s) in {dirs[v.key]}:", file=sys.stderr)
             for path, kind in conflicts:
                 print(f"  {path}  ({kind})", file=sys.stderr)
-            print(f"\nResolve them, then run: backporter continue {url} {v.key}", file=sys.stderr)
-            sys.exit(1)
+            print(f"\nResolve them, then run: backporter continue {pr.html_url} {v.key}", file=sys.stderr)
+            return False
         finish_backport(gh, project, config, item, v, pr, dirs[v.key])
+    return True
+
+
+def cmd_start(args, gh: Github, config: Config) -> None:
+    pr_repo, number = git_ops.parse_pr_url(args.pr)
+    url = source_url(pr_repo, number)
+    pr = gh.get_repo(pr_repo).get_pull(number)
+    project = open_project(gh, config)
+    versions = project_versions(project, config)
+    items = pr_items(project, url)
+    if args.versions:
+        targets = [find_version(versions, k) for k in args.versions]
+        untracked = [v.key for v in targets if v.key not in items]
+        if untracked:
+            raise RuntimeError(f"Not tracked: {', '.join(untracked)}; run `backporter add` first")
+    else:
+        targets = [v for v in versions if v.key in items and items[v.key].status in (NOT_STARTED, APPROVED)]
+    if not targets:
+        print("Nothing to start.")
+        return
+    dirs = load_dirs(args.dirs, versions)
+    no_dir = [v.key for v in targets if v.key not in dirs]
+    if no_dir:
+        raise RuntimeError(f"No clone dir for {', '.join(no_dir)}; pass -C KEY=DIR or set it in the dirs file")
+    if not backport(gh, project, config, pr, pr_repo, items, targets, dirs, args.ai):
+        sys.exit(1)
+
+
+def cmd_run(args, gh: Github, config: Config) -> None:
+    """scan, then backport every Approved item that has a clone dir; problems go to the item's Note."""
+    scan(gh, config, None)
+    project = open_project(gh, config)
+    versions = project_versions(project, config)
+    dirs = load_dirs(args.dirs, versions)
+    use_ai = config.run_ai and not args.no_ai
+    approved: dict[str, list[Item]] = defaultdict(list)
+    for item in tracked_items(project):
+        if item.status == APPROVED:
+            approved[item.source_pr].append(item)
+    if not approved:
+        print("\nNothing approved to run.")
+        return
+    failed = False
+    for url, its in approved.items():
+        print(f"\n##### {url}")
+        targets = [v for v in versions if v.key in {i.version for i in its}]
+        no_dir = [v.key for v in targets if v.key not in dirs]
+        if no_dir:
+            print(f"No clone dir for {', '.join(no_dir)}; skipped", file=sys.stderr)
+        targets = [v for v in targets if v.key in dirs]
+        if not targets:
+            continue
+        pr_repo, number = git_ops.parse_pr_url(url)
+        items = pr_items(project, url)
+        try:
+            pr = gh.get_repo(pr_repo).get_pull(number)
+            if not pr.merged:
+                print("Source PR is not merged yet; skipped", file=sys.stderr)
+                continue
+            if not backport(gh, project, config, pr, pr_repo, items, targets, dirs, use_ai):
+                failed = True
+        except (RuntimeError, ValueError, GithubException) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            for v in targets:
+                project.set_value(items[v.key].id, F_NOTE, f"backporter run failed: {e}")
+            failed = True
+    if failed:
+        sys.exit(1)
 
 
 def cmd_continue(args, gh: Github, config: Config) -> None:
@@ -550,6 +608,12 @@ def main() -> None:
     p.add_argument("versions", nargs="*", help="Version keys (default: all 'Not started' for this PR)")
     p.add_argument("--ai", action="store_true", help="Let AI resolve conflicts (API if ANTHROPIC_API_KEY is set, else claude CLI)")
     p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser(
+        "run", parents=[with_dirs], help="scan, then backport every item whose Status is Approved",
+    )
+    p.add_argument("--no-ai", action="store_true", help="Don't use AI for conflicts (default: [run] ai in config)")
+    p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("continue", parents=[with_dirs], help="Finish a backport after resolving conflicts")
     p.add_argument("pr", help="Source PR URL")
