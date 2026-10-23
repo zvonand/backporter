@@ -47,14 +47,14 @@ Two columns, with separate owners:
 - **Decision** is yours. Set it in any view; empty means undecided, and nothing is backported until someone decides.
   - **`Approved`**: do it. The next `backporter run` backports it: cherry-pick, push, and a labeled PR in `Altinity/ClickHouse`. AI resolves conflicts by default.
   - **`Discarded`**: don't do it. The item stays as a record, and the backporter never touches it again.
-- **Status** belongs to the backporter. Don't edit it. Together with **Backport PR** and **Note**, it shows what happened:
+- **Status** belongs to the backporter. Don't edit it. Together with **Note**, it shows what happened. Once a backport PR exists, the row *is* that PR, so its title links to it:
 
 | Status | Meaning |
 |---|---|
 | `Not started` | nothing done yet; with Decision `Approved` it's queued for the next `run` (`Note` says why, if a run couldn't do it) |
 | `Conflicts` | needs a human: unresolved conflicts, or a PR body that couldn't be built; `Note` has the reason |
-| `PR open` / `Merged` / `Closed` | backport PR in `Backport PR` |
-| `Already present` | already in that branch; `Backport PR` names the PR that brought it, if found |
+| `PR open` / `Merged` / `Closed` | the row is the backport PR |
+| `Already present` | already in that branch; `Note` names the PR that brought it, if found |
 | `Not applicable` | makes no sense for that version; `Note` says why |
 
 `backporter scan` refreshes statuses from GitHub and lists what's still pending. To backport one PR right away without approving, run `backporter start <PR>`.
@@ -204,9 +204,9 @@ Draft items can't have comments, so the explanation goes in `Note`. Notes and fo
 - **Hidden:** the built-in Assignees, Linked pull requests and Sub-issues progress, which are always empty for draft items.
 - **Left alone:** other columns you turn on yourself.
 
-GitHub's API can't set column order. Columns follow the order in which the fields were created, so `init` creates the fields people use first: Decision, Backport PR, Note, then Requested, Flavor and Source PR. Version comes last, because GitHub won't create a select field without options and the first `add-version` creates it. To change the order in a view, drag the column headers in the web page and save the view.
+GitHub's API can't set column order. Columns follow the order in which the fields were created, so `init` creates the fields people use first: Decision, Backport PR, Note, then Requested, Requested by, Flavor and Source PR. Version and Not needed from come last, because GitHub won't create a select field without options and the first `add-version` creates them. To change the order in a view, drag the column headers in the web page and save the view.
 
-The project is the source of truth. Items can also be edited in the GitHub UI, e.g. to set a Status by hand.
+The project is the source of truth. People set Decision (and the request cells); everything else is maintained by the backporter.
 
 ## Setup
 
@@ -251,11 +251,12 @@ It then backfills: every tracked PR whose explicit requests imply a new version 
 ### `add`
 
 ```bash
-backporter add <PR-URL> <version>
+backporter add <PR-URL> <version> [--not-needed-from X.Y]
 ```
 
-Creates items for `<version>` (Requested `explicit`) and every version it implies (`implied`), all with Status `Not started`.
-- Items that already exist are left as they are, except that an `implied` item for `<version>` becomes `explicit`.
+The command-line equivalent of a web request, with Requested by = the token's owner. It creates items for `<version>` (Requested `explicit`) and every version it implies (`implied`), all with Status `Not started`.
+- `--not-needed-from` works like the request's **Not needed from** cell: implied versions from X.Y up get `Not applicable` rows.
+- Items that already exist are left as they are, except that an `implied` item for `<version>` becomes `explicit`, and a `Discarded` one is reopened (see [Requesting again](#requesting-a-backport)).
 - Re-running is safe and fills in any missing implied items.
 
 ### `remove`
@@ -277,7 +278,7 @@ backporter scan [--version KEY]
 ```
 
 1. Processes requests added in the web page (see [Requesting a backport](#requesting-a-backport)): each requested version is handled like `add`, then the request row is deleted.
-2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`, and not `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>`, so backports opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`).
+2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`, and not `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>`, so backports opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`), and turns a draft row into that PR's row.
 3. Lists items still `Not started` or in `Conflicts`, grouped by version, with their Decision. `Discarded` items are left out.
 4. Reports PRs that are missing versions implied by their explicit requests.
 
@@ -296,7 +297,7 @@ Backports a merged PR right away. Running it counts as the decision, so no appro
 3. Cherry-picks the PR's merge commit with `-m 1`. If the PR is not from `Altinity/ClickHouse`, the commit is fetched from an `upstream` remote, which is added or updated automatically.
 4. Pushes the branch to `origin`.
 5. Opens a PR into the target branch titled `<Stable|Antalya> X.Y Backport of #N - <exact source PR title>`, with the labels configured for its version (see Configuration). If an open PR already exists for the branch, it is reused. The body is built before anything is pushed (see [PR body](#pr-body)).
-6. Sets `Backport PR` and Status `PR open`.
+6. Replaces the draft row by the backport PR (same field values), and sets `Backport PR` and Status `PR open`.
 
 **Already present.** If the cherry-pick turns out empty, the change is already in the target branch. The tool then:
 1. Drops the local backport branch.
@@ -392,7 +393,7 @@ If neither the code nor the AI produces a valid body (or no AI is available, or 
 
 ## AI conflict resolution
 
-`start --ai` and `continue --ai` hand conflicts to Claude:
+`run` (unless `--no-ai` or `[run] ai = false`), `start --ai` and `continue --ai` hand conflicts to Claude:
 
 - **Anthropic API**, when `ANTHROPIC_API_KEY` is set. The backporter runs the agent loop itself (`backporter/ai_api.py`, model `claude-opus-5-5`), and its tools run locally:
   - `bash` runs one command without a shell. Allowed: `git status/diff/log/show/grep/blame/ls-files/merge-base/rev-parse/cat-file/add/rm`, `git checkout --ours|--theirs`, and `ls/cat/head/tail/grep/rg/wc` on paths inside the repo.
@@ -406,7 +407,7 @@ In both modes the AI process gets no `GITHUB_TOKEN`/`GH_TOKEN`/`ANTHROPIC_API_KE
 
 ## Clone dirs
 
-`start` and `continue` need a local ClickHouse clone per version, with `origin` pointing to `Altinity/ClickHouse` (enforced, see Safety). One clone can serve several versions. Configure them in `~/.config/backporter/dirs.toml` (local, not committed):
+`run`, `start` and `continue` (and `mark present`, for its lookup) need a local ClickHouse clone per version, with `origin` pointing to `Altinity/ClickHouse` (enforced, see Safety). One clone can serve several versions. Configure them in `~/.config/backporter/dirs.toml` (local, not committed):
 
 ```toml
 "stable-25.8" = "~/src/releases/258"
