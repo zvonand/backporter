@@ -19,10 +19,16 @@ project_number = 39
 ai = true
 
 # Labels added to every backport PR the backporter opens. They must already exist in Altinity/ClickHouse.
+# Per-version labels follow the team's backport PR convention.
 [labels]
 all = ["backport"]
-# Extra labels by flavor:
-# stable = ["stable"]
-# antalya = ["antalya"]
-# Extra labels by version key:
-# "antalya-25.8" = ["antalya-25.8"]
+stable = ["stable"]
+antalya = ["antalya"]
+"stable-25.3" = ["25.3", "25.3.14"]
+"stable-25.8" = ["25.8", "stable-25.8"]
+# The convention adds "stable-26.3", but that label doesn't exist in Altinity/ClickHouse yet.
+"stable-26.3" = ["26.3"]
+"antalya-25.8" = ["antalya-25.8"]
+"antalya-26.3" = ["antalya-26.3"]
+"antalya-26.6" = ["antalya-26.6"]
+"antalya-26.8" = ["antalya-26.8"]

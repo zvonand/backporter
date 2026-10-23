@@ -147,7 +147,7 @@ def resolve(repo_dir: str, prompt: str, conflicts: list[tuple[str, str]]) -> Res
         text = ai_api.run_agent(repo_dir, prompt, os.environ["ANTHROPIC_API_KEY"], locked_env())
     else:
         print("AI: resolving with the claude CLI...")
-        text = _run_cli(repo_dir, prompt)
+        text = _run_cli(repo_dir, prompt, _resolve_tools())
     result = parse_result(text)
     if result.outcome == RESOLVED:
         problem = check_resolved(repo_dir, head_before, conflicts)
@@ -157,24 +157,38 @@ def resolve(repo_dir: str, prompt: str, conflicts: list[tuple[str, str]]) -> Res
     return result
 
 
-def _run_cli(repo_dir: str, prompt: str) -> str:
-    claude = shutil.which("claude")
-    if not claude:
-        raise RuntimeError("`claude` CLI not found on PATH; install Claude Code or set ANTHROPIC_API_KEY")
+def complete(prompt: str) -> str:
+    """A single text answer, without any tools (API if ANTHROPIC_API_KEY is set, else the claude CLI)."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        from backporter import ai_api
+
+        return ai_api.complete(prompt, os.environ["ANTHROPIC_API_KEY"])
+    return _run_cli(tempfile.mkdtemp(prefix="backporter-ai-"), prompt, [])
+
+
+def _resolve_tools() -> list[str]:
     # File tools only inside the repo (paths relative to the working directory).
     allowed = ["Read(./**)", "Edit(./**)", "Write(./**)", "Glob(./**)", "Grep(./**)"]
     allowed += [f"Bash(git {sub} *)" for sub in GIT_SUBCOMMANDS if sub != "checkout"]
     allowed += ["Bash(git checkout --ours *)", "Bash(git checkout --theirs *)"]
     allowed += [f"Bash({cmd} *)" for cmd in OTHER_COMMANDS]
+    return allowed
+
+
+def _run_cli(cwd: str, prompt: str, allowed: list[str]) -> str:
+    """Run `claude -p` in cwd, sandboxed to the `allowed` tools (none if empty); returns its final text."""
+    claude = shutil.which("claude")
+    if not claude:
+        raise RuntimeError("`claude` CLI not found on PATH; install Claude Code or set ANTHROPIC_API_KEY")
     cmd = [
         claude, "-p", "--output-format", "stream-json", "--verbose",
         # No user/project settings, MCP servers, plugins or hooks: only the tools listed here are usable.
         "--safe-mode", "--strict-mcp-config", "--setting-sources", "",
         "--permission-mode", "dontAsk", "--permission-prompts", "none", "--no-session-persistence",
-        "--allowedTools", *allowed, "--disallowedTools", *_CLI_DENY,
+        *(["--allowedTools", *allowed] if allowed else []), "--disallowedTools", *_CLI_DENY,
     ]
     proc = subprocess.Popen(
-        cmd, cwd=repo_dir, env=locked_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        cmd, cwd=cwd, env=locked_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, start_new_session=True,
     )
     proc.stdin.write(prompt)

@@ -10,7 +10,7 @@ Backport tracker backed by a GitHub Project.
     backporter run [--no-ai]                  scan, then backport everything with Decision Approved
     backporter continue <PR-URL> <version>    finish after resolving conflicts (--ai: let AI resolve them)
     backporter mark <PR-URL> <version> present|not-applicable [--by URL] [--note TEXT]
-    backporter describe <PR-URL>              print changelog description of a PR
+    backporter describe <PR-URL>              print a PR's changelog category and entry (as in backport PRs)
 """
 
 import argparse
@@ -23,8 +23,7 @@ from github import Github, GithubException
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
-from backporter import ai, git_ops
-from backporter.changelog_extract import make_changelog_description
+from backporter import ai, git_ops, pr_body
 from backporter.github_guard import guarded_github
 from backporter.config import (
     CONFIG_PATH, FLAVORS, TARGET_REPO, Config, Version, find_version, load_config, load_dirs, load_dotenv,
@@ -101,8 +100,29 @@ def create_item(
     )
 
 
-def changelog(pr: PullRequest) -> str:
-    return make_changelog_description(pr.body, pr_url=pr.html_url, pr_author=pr.user.login if pr.user else None)
+def backport_body(repo_dir: str, version: Version, pr: PullRequest) -> str:
+    """
+    The target branch's PR template with the source PR's changelog category and entry (see pr_body).
+    The AI fills them only when the source is unclear. Raises pr_body.Unclear/TemplateError if a human is needed.
+    """
+    if not pr.user:
+        raise pr_body.Unclear("the source PR has no author")
+    try:
+        template = git_ops.show_file(repo_dir, version.branch, pr_body.TEMPLATE_PATH)
+    except RuntimeError:
+        raise pr_body.TemplateError(f"{pr_body.TEMPLATE_PATH} not found on {version.branch}")
+    try:
+        return pr_body.build(template, pr.body or "", pr.html_url, pr.user.login)
+    except pr_body.Unclear as e:
+        print(f"PR body: {e}; asking the AI...")
+        prompt = pr_body.prompt(template, pr.body or "", pr.html_url, pr.user.login, pr.title, str(e))
+        try:
+            answer = ai.complete(prompt)
+        except RuntimeError as ai_error:
+            raise pr_body.Unclear(f"{e}; AI unavailable: {ai_error}")
+        body = pr_body.parse_answer(answer)
+        pr_body.check(template, body, pr.html_url, pr.user.login)
+        return body
 
 
 def cmd_init(args, gh: Github, config: Config) -> None:
@@ -318,9 +338,19 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
 
 def finish_backport(
     gh: Github, project: Project, config: Config, item: Item, version: Version, pr: PullRequest, repo_dir: str
-) -> None:
-    """Push the backport branch, open (or reuse) the backport PR, update the project item."""
+) -> bool:
+    """
+    Push the backport branch, open (or reuse) the backport PR, update the project item.
+    False, with nothing pushed, if the PR body needs a human.
+    """
     branch = backport_branch(version, pr.number)
+    try:
+        body = backport_body(repo_dir, version, pr)
+    except (pr_body.Unclear, pr_body.TemplateError) as e:
+        project.set_value(item.id, F_NOTE, f"PR body needs a human: {e}")
+        project.set_value(item.id, F_STATUS, CONFLICTS)
+        print(f"PR body needs a human: {e}. Nothing pushed; the branch {branch} stays in {repo_dir}.", file=sys.stderr)
+        return False
     git_ops.push(repo_dir, branch, TARGET_REPO)
     repo = gh.get_repo(TARGET_REPO)
     # get_repo follows renames/redirects; never open a PR anywhere but TARGET_REPO.
@@ -333,7 +363,6 @@ def finish_backport(
         print(f"Reusing open PR {backport.html_url}")
     else:
         print(f"Opening PR {branch} -> {version.branch} in {TARGET_REPO}...")
-        body = f"Backport of {pr.html_url}\n\n{changelog(pr)}".strip()
         backport = repo.create_pull(
             base=version.branch,
             head=branch,
@@ -348,6 +377,7 @@ def finish_backport(
     project.set_value(item.id, F_BACKPORT_PR, backport.html_url)
     project.set_value(item.id, F_STATUS, PR_OPEN)
     print(f"{version.key}: {backport.html_url}")
+    return True
 
 
 def set_outcome(project: Project, item: Item, status: str, note: str, by: str | None = None) -> None:
@@ -401,8 +431,7 @@ def resolve_with_ai(
             record_present(gh, project, item, version, pr, pr_repo, repo_dir, f"AI: {result.note}")
             return True
         project.set_value(item.id, F_NOTE, f"AI resolved conflicts: {result.note}")
-        finish_backport(gh, project, config, item, version, pr, repo_dir)
-        return True
+        return finish_backport(gh, project, config, item, version, pr, repo_dir)
     if result.outcome == ai.ALREADY_PRESENT:
         record_present(gh, project, item, version, pr, pr_repo, repo_dir, f"AI: {result.note}", result.by or None)
         return True
@@ -458,7 +487,8 @@ def backport(
                 print(f"  {path}  ({kind})", file=sys.stderr)
             print(f"\nResolve them, then run: backporter continue {pr.html_url} {v.key}", file=sys.stderr)
             return False
-        finish_backport(gh, project, config, item, v, pr, dirs[v.key])
+        if not finish_backport(gh, project, config, item, v, pr, dirs[v.key]):
+            return False
     return True
 
 
@@ -562,7 +592,8 @@ def cmd_continue(args, gh: Github, config: Config) -> None:
     if git_ops.continue_cherry_pick(dirs[version.key], backport_branch(version, number)) == git_ops.EMPTY:
         record_present(gh, project, item, version, pr, pr_repo, dirs[version.key])
         return
-    finish_backport(gh, project, config, item, version, pr, dirs[version.key])
+    if not finish_backport(gh, project, config, item, version, pr, dirs[version.key]):
+        sys.exit(1)
 
 
 def cmd_mark(args, gh: Github, config: Config) -> None:
@@ -592,7 +623,10 @@ def cmd_mark(args, gh: Github, config: Config) -> None:
 
 def cmd_describe(args, gh: Github, config: Config) -> None:
     pr_repo, number = git_ops.parse_pr_url(args.pr)
-    print(changelog(gh.get_repo(pr_repo).get_pull(number)))
+    pr = gh.get_repo(pr_repo).get_pull(number)
+    category, entry = pr_body.source_parts(pr.body or "")
+    print(category)
+    print("\n".join(pr_body.attribute(entry, pr.html_url, pr.user.login if pr.user else "")))
 
 
 def main() -> None:

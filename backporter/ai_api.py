@@ -164,6 +164,24 @@ def _execute(repo_dir: str, name: str, args: dict, env: dict[str, str]) -> str:
     return _write(repo_dir, args)
 
 
+def complete(prompt: str, api_key: str) -> str:
+    """A single text answer without tools."""
+    client = anthropic.Anthropic(api_key=api_key)
+    with client.beta.messages.stream(
+        model=MODEL,
+        max_tokens=64000,
+        messages=[{"role": "user", "content": prompt}],
+        thinking={"type": "adaptive"},
+        output_config={"effort": "high"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+    ) as stream:
+        response = stream.get_final_message()
+    if response.stop_reason in ("refusal", "max_tokens"):
+        return f"CANNOT: the model stopped ({response.stop_reason})"
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
 def run_agent(repo_dir: str, prompt: str, api_key: str, env: dict[str, str]) -> str:
     """Run the agent loop and return its final text."""
     client = anthropic.Anthropic(api_key=api_key)

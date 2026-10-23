@@ -266,6 +266,11 @@ def continue_cherry_pick(repo_dir: str, backport_branch: str) -> str:
     return PICKED
 
 
+def show_file(repo_dir: str, ref: str, path: str) -> str:
+    """Contents of path at ref."""
+    return run(["git", "show", f"{ref}:{path}"], cwd=repo_dir).stdout
+
+
 def push(repo_dir: str, branch: str, target_repo: str) -> None:
     check_origin(repo_dir, target_repo)
     print(f"Pushing {branch} to {target_repo}...")

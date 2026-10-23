@@ -48,7 +48,7 @@ Two columns, with separate owners:
 | Status | Meaning |
 |---|---|
 | `Not started` | nothing done yet; with Decision `Approved` it's queued for the next `run` (`Note` says why, if a run couldn't do it) |
-| `Conflicts` | needs a human; `Note` has the AI's reason if it tried |
+| `Conflicts` | needs a human: unresolved conflicts, or a PR body that couldn't be built; `Note` has the reason |
 | `PR open` / `Merged` / `Closed` | backport PR in `Backport PR` |
 | `Already present` | already in that branch; `Backport PR` names the PR that brought it, if found |
 | `Not applicable` | makes no sense for that version; `Note` says why |
@@ -115,11 +115,13 @@ The token is used for the GitHub API only. `git fetch`/`git push` in the clone d
   ```toml
   [labels]
   all = ["backport"]
+  stable = ["stable"]
   antalya = ["antalya"]
+  "stable-25.8" = ["25.8", "stable-25.8"]
   "antalya-25.8" = ["antalya-25.8"]
   ```
 
-  With this config, a backport into `antalya-25.8` gets `backport`, `antalya` and `antalya-25.8`, and one into `stable-25.8` gets only `backport`. Labels must already exist in `Altinity/ClickHouse`; the backporter never creates them. `start` and `continue` check this before any git work and stop on a missing label.
+  With this config, a backport into `antalya-25.8` gets `backport`, `antalya` and `antalya-25.8`, and one into `stable-25.8` gets `backport`, `stable`, `25.8` and `stable-25.8`. The committed config follows the team's backport PR convention for every version. Labels must already exist in `Altinity/ClickHouse`; the backporter never creates them. `start` and `continue` check this before any git work and stop on a missing label.
 
 - `[branches]`: the branch in `Altinity/ClickHouse` for each version key. Branch names don't follow one pattern, so each is listed explicitly:
 
@@ -287,7 +289,7 @@ Backports a merged PR right away. Running it counts as the decision, so no appro
 2. Creates `backports/<branch>/<N>`.
 3. Cherry-picks the PR's merge commit with `-m 1`. If the PR is not from `Altinity/ClickHouse`, the commit is fetched from an `upstream` remote, which is added or updated automatically.
 4. Pushes the branch to `origin`.
-5. Opens a PR into the target branch titled `<Stable|Antalya> X.Y Backport of #N - <title>`. Its body links the source PR and carries the Changelog category and entry from the source PR, with the source link and author appended to the entry. If an open PR already exists for the branch, it is reused. The PR gets the labels configured for its version (see Configuration).
+5. Opens a PR into the target branch titled `<Stable|Antalya> X.Y Backport of #N - <exact source PR title>`, with the labels configured for its version (see Configuration). If an open PR already exists for the branch, it is reused. The body is built before anything is pushed (see [PR body](#pr-body)).
 6. Sets `Backport PR` and Status `PR open`.
 
 **Already present.** If the cherry-pick turns out empty, the change is already in the target branch. The tool then:
@@ -360,7 +362,27 @@ Records a decision made while resolving by hand. It drops the local backport bra
 backporter describe <PR-URL>
 ```
 
-Prints the Changelog category and entry from the PR body. It does not use the project.
+Prints the PR's selected Changelog category and its entry with attribution, exactly as they would go into a backport PR body. It doesn't use the project.
+
+## PR body
+
+A backport PR's body is the **target branch's own `.github/PULL_REQUEST_TEMPLATE.md`**, read from the clone, with exactly two regions filled from the source PR:
+
+- **Changelog category:** the template's list of choices is replaced by the one category the source PR selected, copied verbatim (list marker and parenthetical included, no reclassification).
+- **Changelog entry:** the template's placeholder is replaced by the source PR's entry, copied verbatim, with ` (<source PR URL> by @<author login>)` appended to its last line.
+
+Everything else stays byte-for-byte as in the template, in particular the **CI/CD options and their checkbox states**, which are each branch's defaults. To change what CI runs for backports into a branch, change that branch's template. Nothing else is copied from the source PR.
+
+**Unclear source PR.** The code handles the normal case. The AI ([AI conflict resolution](#ai-conflict-resolution) explains which backend) gets a prompt with the template, the source PR body and these same rules when:
+- the source PR selects no category or several;
+- its entry is empty or a placeholder;
+- the entry is followed by more text with no heading in between;
+- the entry already has an attribution;
+- the entry ends in a code block, table, quote or HTML.
+
+The AI either returns a body or says why it can't. Its body is accepted only if it's the template with nothing changed except one category line and an entry ending in the attribution.
+
+If neither the code nor the AI produces a valid body (or no AI is available, or the template is missing), **nothing is pushed**. The item gets Status `Conflicts` with `PR body needs a human: <reason>` in `Note`, and the backport branch stays in the clone.
 
 ## AI conflict resolution
 
