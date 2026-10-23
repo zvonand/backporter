@@ -333,12 +333,12 @@ The command for working through the project, by hand or on a schedule:
 1. Runs `scan`.
 2. Backports every `Not started` item whose Decision is `Approved`, grouped by source PR, oldest version first, the same way as `start`.
 
-AI conflict resolution is on by default. Set `[run] ai = false` in `config.toml` to turn it off, or pass `--no-ai` for one run.
+AI conflict resolution is on by default. Set `[run] ai = false` in `config.toml` to turn it off, or pass `--no-ai` for one run. If neither the `claude` CLI nor `ANTHROPIC_API_KEY` is available, `run` says so and continues without AI. `start --ai`/`continue --ai` stop with an error instead.
 
 Unlike `start`, a problem doesn't stop the whole run:
 - An item whose version has no clone dir, or whose source PR isn't merged yet, is skipped and stays queued.
 - An error (e.g. a misconfigured clone) is written to the item's `Note`, and the item stays queued for the next run.
-- Unresolved conflicts set `Conflicts`.
+- Unresolved conflicts set `Conflicts`, and that attempt is dropped (cherry-pick aborted, branch deleted) so the shared clone stays clean for the next PR. `Note` lists the conflicted files and how to do it by hand: `backporter start <PR> <version>`, resolve, then `backporter continue <PR> <version>`. The run goes on with the remaining versions and PRs.
 
 The run exits with code 1 if anything failed or needs a human.
 

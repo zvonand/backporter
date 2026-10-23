@@ -618,15 +618,20 @@ def check_labels(gh: Github, config: Config, versions: list[Version]) -> None:
 
 def backport(
     gh: Github, project: Project, config: Config, pr: PullRequest, pr_repo: str, items: dict[str, Item],
-    targets: list[Version], dirs: dict[str, str], use_ai: bool,
+    targets: list[Version], dirs: dict[str, str], use_ai: bool, keep_clone_clean: bool = False,
 ) -> bool:
-    """Backport pr into targets (each has a clone dir), oldest first. False if stopped at unresolved conflicts."""
+    """
+    Backport pr into targets (each has a clone dir), oldest first. False if a version ended in unresolved conflicts.
+    By default it stops there, leaving the conflicts in progress for `continue`. With keep_clone_clean (for `run`,
+    where clones are shared) it drops that attempt, notes how to redo it by hand, and goes on with the next version.
+    """
     merge_sha = git_ops.get_merge_commit_sha(pr)
     for v in targets:
         git_ops.check_repo_dir(dirs[v.key])
         git_ops.check_origin(dirs[v.key], TARGET_REPO)
     check_labels(gh, config, targets)
 
+    ok = True
     for v in sort_versions(targets):
         item = items[v.key]
         print(f"\n=== {v.key} ===")
@@ -643,11 +648,20 @@ def backport(
             print(f"\nConflicts in {len(conflicts)} file(s) in {dirs[v.key]}:", file=sys.stderr)
             for path, kind in conflicts:
                 print(f"  {path}  ({kind})", file=sys.stderr)
-            print(f"\nResolve them, then run: backporter continue {pr.html_url} {v.key}", file=sys.stderr)
-            return False
+            if not keep_clone_clean:
+                print(f"\nResolve them, then run: backporter continue {pr.html_url} {v.key}", file=sys.stderr)
+                return False
+            git_ops.drop_backport_branch(dirs[v.key], v.branch, backport_branch(v, pr.number))
+            files = ", ".join(path for path, _ in conflicts)
+            redo = f"backporter start {pr.html_url} {v.key}, resolve, then backporter continue {pr.html_url} {v.key}"
+            if not use_ai:
+                project.set_value(item.id, F_NOTE, f"Conflicts in {files}; to do it by hand: {redo}")
+            print(f"Dropped this attempt to keep {dirs[v.key]} clean; to do it by hand: {redo}", file=sys.stderr)
+            ok = False
+            continue
         if not finish_backport(gh, project, config, item, v, pr, dirs[v.key]):
-            return False
-    return True
+            ok = False
+    return ok
 
 
 def cmd_start(args, gh: Github, config: Config) -> None:
@@ -674,6 +688,8 @@ def cmd_start(args, gh: Github, config: Config) -> None:
     no_dir = [v.key for v in targets if v.key not in dirs]
     if no_dir:
         raise RuntimeError(f"No clone dir for {', '.join(no_dir)}; pass -C KEY=DIR or set it in the dirs file")
+    if args.ai and (reason := ai.unavailable()):
+        raise RuntimeError(f"--ai: {reason}")
     if not backport(gh, project, config, pr, pr_repo, items, targets, dirs, args.ai):
         sys.exit(1)
 
@@ -685,6 +701,9 @@ def cmd_run(args, gh: Github, config: Config) -> None:
     versions = project_versions(project, config)
     dirs = load_dirs(args.dirs, versions)
     use_ai = config.run_ai and not args.no_ai
+    if use_ai and (reason := ai.unavailable()):
+        print(f"AI conflict resolution is off for this run: {reason}", file=sys.stderr)
+        use_ai = False
     approved: dict[str, list[Item]] = defaultdict(list)
     for item in tracked_items(project):
         if item.status == NOT_STARTED and item.decision == APPROVED:
@@ -711,7 +730,7 @@ def cmd_run(args, gh: Github, config: Config) -> None:
             if not pr.merged:
                 print("Source PR is not merged yet; skipped", file=sys.stderr)
                 continue
-            if not backport(gh, project, config, pr, pr_repo, items, targets, dirs, use_ai):
+            if not backport(gh, project, config, pr, pr_repo, items, targets, dirs, use_ai, keep_clone_clean=True):
                 failed = True
         except (RuntimeError, ValueError, GithubException) as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -737,6 +756,8 @@ def cmd_continue(args, gh: Github, config: Config) -> None:
     pr = gh.get_repo(pr_repo).get_pull(number)
     repo_dir = dirs[version.key]
     check_labels(gh, config, [version])
+    if args.ai and (reason := ai.unavailable()):
+        raise RuntimeError(f"--ai: {reason}")
     if args.ai:
         git_ops.check_repo_dir(repo_dir)
         git_ops.check_origin(repo_dir, TARGET_REPO)

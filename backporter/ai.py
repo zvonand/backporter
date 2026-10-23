@@ -55,6 +55,13 @@ class Result:
     summary: str = ""
 
 
+def unavailable() -> str | None:
+    """Why AI can't run here, or None if it can."""
+    if os.environ.get("ANTHROPIC_API_KEY") or shutil.which("claude"):
+        return None
+    return "neither the `claude` CLI nor ANTHROPIC_API_KEY is available"
+
+
 def locked_env() -> dict[str, str]:
     """Environment for everything the AI runs: no GitHub/Anthropic credentials, no git network access."""
     env = {k: v for k, v in os.environ.items() if k not in _SECRET_VARS}
