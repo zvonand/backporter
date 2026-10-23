@@ -51,6 +51,8 @@ class Result:
     outcome: str
     note: str
     by: str = ""
+    # A few Markdown lines on what conflicted and how it was resolved
+    summary: str = ""
 
 
 def locked_env() -> dict[str, str]:
@@ -64,7 +66,7 @@ def locked_env() -> dict[str, str]:
 
 
 def build_prompt(repo_dir: str, branch: str, backport_branch: str, pr_url: str, pr_title: str, pr_body: str,
-                 merge_sha: str, conflicts: list[tuple[str, str]]) -> str:
+                 merge_sha: str, conflicts: list[tuple[str, str]], conflict_sha: str) -> str:
     files = "\n".join(f"- {path} ({kind})" for path, kind in conflicts)
     return f"""You are resolving a git cherry-pick conflict for a ClickHouse backport.
 
@@ -79,20 +81,20 @@ Source PR description:
 {pr_body or "(empty)"}
 </pr_description>
 
-The cherry-pick (`git cherry-pick -m 1 {merge_sha}`) stopped with conflicts in:
+The cherry-pick (`git cherry-pick -m 1 {merge_sha}`) had conflicts in:
 {files}
 
-See the full change with `git diff {merge_sha}^1 {merge_sha}` and the conflict state with `git status` and `git diff`.
+The cherry-pick was committed as-is, conflict markers included, as HEAD ({conflict_sha}). See it with `git show HEAD`, and the original change with `git diff {merge_sha}^1 {merge_sha}`.
 
 Your job: make this branch contain the source PR's change, adapted to {branch}. Then decide on exactly one outcome:
-- RESOLVED: you resolved every conflict, keeping the intent of the source PR and the surrounding code of {branch}. Remove all conflict markers and stage each resolved file with `git add <path>` (or `git rm <path>`).
+- RESOLVED: you resolved every conflict, keeping the intent of the source PR and the surrounding code of {branch}. Edit the files to remove all conflict markers and stage each one with `git add <path>` (or `git rm <path>`). The backporter commits your changes as a separate resolution commit.
 - ALREADY_PRESENT: {branch} already contains this change (equivalent code is already there), so nothing needs backporting. If `git log` shows the commit or PR that brought it, give its PR URL.
 - NOT_APPLICABLE: the change makes no sense for {branch}, e.g. the code or feature it fixes doesn't exist there. Explain why.
 - UNRESOLVED: you cannot resolve it with confidence. Explain what blocks you.
 
 Rules:
 - Work only inside {repo_dir}. Change only files involved in this cherry-pick.
-- Do not commit, and do not run `git cherry-pick --continue`, `--abort` or `--skip`. Do not switch branches, reset, fetch or push. The backporter does that.
+- Do not commit, switch branches, reset, fetch or push. The backporter does that.
 - Use one plain command per Bash call, with no pipes, redirections or `&&`.
 - You have no network or GitHub access, so don't try to use them.
 
@@ -100,15 +102,20 @@ End your answer with these lines, exactly:
 OUTCOME: <RESOLVED|ALREADY_PRESENT|NOT_APPLICABLE|UNRESOLVED>
 NOTE: <one line: what you adapted, or why>
 BY: <PR URL that already brought the change; only for ALREADY_PRESENT, omit if unknown>
+SUMMARY:
+<2-5 short Markdown bullet points for reviewers: what conflicted in which file, why, and how you resolved it>
 """
 
 
 def parse_result(text: str) -> Result:
     fields: dict[str, str] = {}
-    for line in text.splitlines():
+    lines = text.splitlines()
+    summary_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*SUMMARY:\s*$", line)), len(lines))
+    for line in lines[:summary_at]:
         match = re.match(r"^\s*(OUTCOME|NOTE|BY):\s*(.*?)\s*$", line)
         if match:
             fields[match.group(1)] = match.group(2)
+    summary = "\n".join(lines[summary_at + 1:]).strip()
     outcome = fields.get("OUTCOME", "").upper()
     if outcome not in OUTCOMES:
         return Result(UNRESOLVED, "AI did not report an outcome")
@@ -117,18 +124,13 @@ def parse_result(text: str) -> Result:
         git_ops.parse_pr_url(by)
     except ValueError:
         by = ""
-    return Result(outcome, fields.get("NOTE", ""), by)
+    return Result(outcome, fields.get("NOTE", ""), by, summary)
 
 
 def check_resolved(repo_dir: str, head_before: str, conflicts: list[tuple[str, str]]) -> str | None:
-    """Why a RESOLVED report doesn't hold, or None if the tree is ready for `cherry-pick --continue`."""
-    if git_ops.run(["git", "rev-parse", "HEAD"], cwd=repo_dir).stdout.strip() != head_before:
+    """Why a RESOLVED report doesn't hold, or None if the working tree is ready for the resolution commit."""
+    if git_ops.head_sha(repo_dir) != head_before:
         return "AI moved HEAD (committed or switched branches)"
-    if not git_ops.is_cherry_pick_in_progress(repo_dir):
-        return "cherry-pick is no longer in progress"
-    unmerged = git_ops.run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo_dir).stdout.split()
-    if unmerged:
-        return f"still unmerged: {', '.join(unmerged)}"
     for path, _ in conflicts:
         full = os.path.join(repo_dir, path)
         if os.path.isfile(full):

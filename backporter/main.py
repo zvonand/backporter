@@ -24,7 +24,7 @@ from github import Github, GithubException
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
-from backporter import ai, git_ops, pr_body
+from backporter import ai, git_ops, github_guard, pr_body
 from backporter.github_guard import guarded_github
 from backporter.config import (
     CONFIG_PATH, FLAVORS, TARGET_REPO, Config, Version, find_version, load_config, load_dirs, load_dotenv,
@@ -32,7 +32,7 @@ from backporter.config import (
 )
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
-    APPROVED, DISCARDED, F_DECISION, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
+    APPROVED, DISCARDED, F_DECISION, F_NOT_NEEDED_FROM, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -78,27 +78,62 @@ def pr_items(project: Project, url: str) -> dict[str, Item]:
 
 def create_item(
     project: Project, version: Version, url: str, title: str, requested: str, requested_by: str,
+    status: str = NOT_STARTED, note: str = "", not_needed_from: str = "",
 ) -> Item:
-    """Add a Not started item; title is '<owner/repo>#<N> <source PR title>'."""
-    title = f"[{version.key}] {title}"
-    item_id = project.add_item(
-        title=title,
-        body=url,
-        values={
-            F_SOURCE_PR: url,
-            F_VERSION: version.key,
-            F_FLAVOR: version.flavor,
-            F_REQUESTED: requested,
-            F_REQUESTED_BY: requested_by,
-            F_STATUS: NOT_STARTED,
-        },
-    )
-    print(f"{version.key}: added {url} ({requested})")
+    """Add an item (Not started unless given); title is '<owner/repo>#<N> <source PR title>'."""
+    values = {
+        F_SOURCE_PR: url,
+        F_VERSION: version.key,
+        F_FLAVOR: version.flavor,
+        F_REQUESTED: requested,
+        F_REQUESTED_BY: requested_by,
+        F_STATUS: status,
+    }
+    if note:
+        values[F_NOTE] = note
+    if not_needed_from:
+        values[F_NOT_NEEDED_FROM] = not_needed_from
+    item_id = project.add_item(title=title, body=url, values=values)
+    print(f"{version.key}: added {url} ({requested}{', ' + status if status != NOT_STARTED else ''})")
     return Item(
         id=item_id, title=title, body=url, content_url="", source_pr=url, version=version.key, flavor=version.flavor,
-        requested=requested, status=NOT_STARTED, backport_pr="", note="", decision="", requested_by=requested_by,
-        creator="",
+        requested=requested, status=status, backport_pr="", note=note, decision="", requested_by=requested_by,
+        not_needed_from=not_needed_from, creator="",
     )
+
+
+def promote(project: Project, item: Item, backport: PullRequest) -> None:
+    """
+    Replace a draft row by the backport PR itself, with the same field values, so the row's Title is the PR
+    (clickable, with its state). Only PRs in TARGET_REPO are ever added to the project.
+    """
+    if item.content_url:
+        return
+    if backport.base.repo.full_name.lower() != TARGET_REPO.lower():
+        raise RuntimeError(f"Refusing to add {backport.html_url} to the project: not in {TARGET_REPO}")
+    github_guard.allow_project_content(backport.node_id)
+    new_id = project.add_existing_item(backport.node_id)
+    values = {
+        F_SOURCE_PR: item.source_pr, F_VERSION: item.version, F_FLAVOR: item.flavor, F_REQUESTED: item.requested,
+        F_REQUESTED_BY: item.requested_by, F_NOT_NEEDED_FROM: item.not_needed_from, F_DECISION: item.decision,
+        F_NOTE: item.note, F_STATUS: item.status,
+    }
+    for field, value in values.items():
+        if value:
+            project.set_value(new_id, field, value)
+    project.delete_item(item.id)
+    item.id, item.content_url, item.title = new_id, backport.html_url, backport.title
+    print(f"    the row is now {backport.html_url}")
+
+
+def version_number(number: str) -> tuple[int, int]:
+    """'26.3' -> (26, 3)"""
+    major, minor = number.split(".")
+    return int(major), int(minor)
+
+
+def not_needed_note(bound: str, requested_by: str) -> str:
+    return f"Not needed from {bound} (per request by @{requested_by})"
 
 
 def backport_body(repo_dir: str, version: Version, pr: PullRequest) -> str:
@@ -168,19 +203,38 @@ def cmd_add_version(args, gh: Github, config: Config) -> None:
             for i in items if i.requested == EXPLICIT and i.version in keys
             for v in closure(find_version(versions, i.version), versions)
         }
-        title = items[0].title.split("] ", 1)[-1]
-        requested_by = next((i.requested_by for i in items if i.requested == EXPLICIT and i.requested_by), "")
+        explicit = [i for i in items if i.requested == EXPLICIT and i.version in keys]
+        title = None
         for version in new:
-            if version.key in needed and version.key not in present:
-                create_item(project, version, url, title, IMPLIED, requested_by)
+            if version.key not in needed or version.key in present:
+                continue
+            if title is None:
+                pr_repo, number = git_ops.parse_pr_url(url)
+                title = f"{pr_repo}#{number} {gh.get_repo(pr_repo).get_pull(number).title}"
+            implied_by = [i for i in explicit if version in closure(find_version(versions, i.version), versions)]
+            active = [
+                i for i in implied_by
+                if not i.not_needed_from or version.version < version_number(i.not_needed_from)
+            ]
+            if active:
+                create_item(project, version, url, title, IMPLIED, active[0].requested_by)
+            else:
+                # Every request implying it said the backport isn't needed from some version below this one.
+                limit = implied_by[0]
+                create_item(
+                    project, version, url, title, IMPLIED, limit.requested_by, NOT_APPLICABLE,
+                    not_needed_note(limit.not_needed_from, limit.requested_by),
+                )
 
 
 def track(
     gh: Github, project: Project, config: Config, pr_url: str, version_key: str, requested_by: str,
-    created: list[Item] | None = None,
+    created: list[Item] | None = None, not_needed_from: str = "",
 ) -> None:
     """
     Track a backport of pr_url to version_key (explicit) and every version it implies, for `requested_by`.
+    Implied versions >= not_needed_from (a version number like '26.3') get new rows marked Not applicable;
+    existing rows are left as they are, since other requests may need them.
     New items are appended to `created`; items already in it count as existing, since GitHub's
     item list can lag behind for a while after items are added.
     """
@@ -189,11 +243,17 @@ def track(
     url = source_url(pr_repo, number)
     versions = project_versions(project, config)
     target = find_version(versions, version_key)
+    bound = version_number(not_needed_from) if not_needed_from else None
+    if bound and target.version >= bound:
+        raise ValueError(f"{target.key} is not below 'Not needed from' {not_needed_from}")
     pr = gh.get_repo(pr_repo).get_pull(number)
     existing = {**pr_items(project, url), **{i.version: i for i in created if i.source_pr == url}}
     for v in closure(target, versions):
         requested = EXPLICIT if v == target else IMPLIED
         item = existing.get(v.key)
+        if item and v == target and not_needed_from and item.not_needed_from != not_needed_from:
+            project.set_value(item.id, F_NOT_NEEDED_FROM, not_needed_from)
+            item.not_needed_from = not_needed_from
         if item:
             if requested == EXPLICIT and item.decision == DISCARDED:
                 # A new request overrides an earlier discard; the Note keeps that history visible.
@@ -213,11 +273,22 @@ def track(
             elif requested == EXPLICIT:
                 print(f"{v.key}: already requested ({item.status})")
             continue
-        created.append(create_item(project, v, url, f"{pr_repo}#{number} {pr.title}", requested, requested_by))
+        title = f"{pr_repo}#{number} {pr.title}"
+        if bound and v.version >= bound:
+            created.append(create_item(
+                project, v, url, title, requested, requested_by, NOT_APPLICABLE,
+                not_needed_note(not_needed_from, requested_by),
+            ))
+        else:
+            created.append(create_item(
+                project, v, url, title, requested, requested_by,
+                not_needed_from=not_needed_from if v == target else "",
+            ))
 
 
 def cmd_add(args, gh: Github, config: Config) -> None:
-    track(gh, open_project(gh, config), config, args.pr, args.version, gh.get_user().login)
+    track(gh, open_project(gh, config), config, args.pr, args.version, gh.get_user().login,
+          not_needed_from=args.not_needed_from or "")
 
 
 def process_requests(gh: Github, project: Project, config: Config) -> list[Item]:
@@ -248,10 +319,19 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
                 f"skipped", file=sys.stderr,
             )
             continue
+        bound = item.not_needed_from
+        too_high = [k for k in requested if bound and version_number(k.split("-", 1)[1]) >= version_number(bound)]
+        if too_high:
+            print(
+                f"Request '{item.title}': {', '.join(too_high)} not below 'Not needed from' {bound}; skipped",
+                file=sys.stderr,
+            )
+            continue
         url = source_url(pr_repo, number)
-        print(f"Request '{item.title}': {url} -> {', '.join(dict.fromkeys(requested))}")
+        limit = f" (not needed from {bound})" if bound else ""
+        print(f"Request '{item.title}': {url} -> {', '.join(dict.fromkeys(requested))}{limit}")
         for key in dict.fromkeys(requested):
-            track(gh, project, config, url, key, item.creator, created)
+            track(gh, project, config, url, key, item.creator, created, bound)
         project.delete_item(item.id)
     return created
 
@@ -315,6 +395,7 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
         if pr is None:
             continue
         status = MERGED if pr.merged_at else CLOSED if pr.state == "closed" else PR_OPEN
+        promote(project, item, pr)
         if pr.html_url != item.backport_pr:
             project.set_value(item.id, F_BACKPORT_PR, pr.html_url)
             item.backport_pr = pr.html_url
@@ -351,7 +432,8 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
 
 
 def finish_backport(
-    gh: Github, project: Project, config: Config, item: Item, version: Version, pr: PullRequest, repo_dir: str
+    gh: Github, project: Project, config: Config, item: Item, version: Version, pr: PullRequest, repo_dir: str,
+    comment: str = "",
 ) -> bool:
     """
     Push the backport branch, open (or reuse) the backport PR, update the project item.
@@ -387,7 +469,12 @@ def finish_backport(
     if labels:
         print(f"Adding labels: {', '.join(labels)}")
         backport.add_to_labels(*labels)
+    if comment:
+        print("Commenting on the PR with a summary of the conflicts...")
+        github_guard.allow_comment(backport.number)
+        backport.create_issue_comment(comment)
     print("Updating the project...")
+    promote(project, item, backport)
     project.set_value(item.id, F_BACKPORT_PR, backport.html_url)
     project.set_value(item.id, F_STATUS, PR_OPEN)
     print(f"{version.key}: {backport.html_url}")
@@ -434,18 +521,29 @@ def resolve_with_ai(
     gh: Github, project: Project, config: Config, item: Item, version: Version, pr: PullRequest, pr_repo: str,
     repo_dir: str, conflicts: list[tuple[str, str]],
 ) -> bool:
-    """Let the AI resolve the conflicts in repo_dir and act on its outcome. False if it stayed unresolved."""
+    """
+    Commit the cherry-pick with its conflicts as-is, let the AI resolve them, commit the resolution separately,
+    and act on the AI's outcome. False if it stayed unresolved (the conflicts are then left in progress again).
+    """
     branch = backport_branch(version, pr.number)
+    conflict_sha = git_ops.commit_conflicts(repo_dir, conflicts)
+    print(f"Committed the cherry-pick with its conflicts as-is: {conflict_sha[:12]}")
     prompt = ai.build_prompt(
         repo_dir, version.branch, branch, pr.html_url, pr.title, pr.body or "", pr.merge_commit_sha, conflicts,
+        conflict_sha,
     )
     result = ai.resolve(repo_dir, prompt, conflicts)
     if result.outcome == ai.RESOLVED:
-        if git_ops.continue_cherry_pick(repo_dir, branch) == git_ops.EMPTY:
+        resolution_sha = git_ops.commit_resolution(
+            repo_dir, f"Resolve conflicts in backport of #{pr.number}\n\n{result.note}\n"
+        )
+        print(f"Committed the resolution: {resolution_sha[:12]}")
+        if git_ops.same_tree(repo_dir, version.branch):
             record_present(gh, project, item, version, pr, pr_repo, repo_dir, f"AI: {result.note}")
             return True
         project.set_value(item.id, F_NOTE, f"AI resolved conflicts: {result.note}")
-        return finish_backport(gh, project, config, item, version, pr, repo_dir)
+        comment = conflict_comment(conflicts, conflict_sha, resolution_sha, result)
+        return finish_backport(gh, project, config, item, version, pr, repo_dir, comment)
     if result.outcome == ai.ALREADY_PRESENT:
         record_present(gh, project, item, version, pr, pr_repo, repo_dir, f"AI: {result.note}", result.by or None)
         return True
@@ -453,9 +551,22 @@ def resolve_with_ai(
         git_ops.drop_backport_branch(repo_dir, version.branch, branch)
         set_outcome(project, item, NOT_APPLICABLE, f"AI: {result.note}")
         return True
+    git_ops.redo_pick(repo_dir, pr.merge_commit_sha)
     project.set_value(item.id, F_NOTE, f"AI could not resolve: {result.note}")
     project.set_value(item.id, F_STATUS, CONFLICTS)
     return False
+
+
+def conflict_comment(conflicts: list[tuple[str, str]], conflict_sha: str, resolution_sha: str, result: ai.Result) -> str:
+    """Comment for the backport PR: what conflicted and how the AI resolved it."""
+    files = "\n".join(f"- `{path}` ({kind})" for path, kind in conflicts)
+    return (
+        "**Backporter: cherry-pick conflicts resolved by AI**\n\n"
+        f"Conflicted files:\n{files}\n\n"
+        f"Commits:\n- {conflict_sha[:12]}: cherry-pick with the conflicts committed as-is\n"
+        f"- {resolution_sha[:12]}: resolution\n\n"
+        f"{result.summary or result.note}\n"
+    )
 
 
 def check_labels(gh: Github, config: Config, versions: list[Version]) -> None:
@@ -677,6 +788,10 @@ def main() -> None:
     p = sub.add_parser("add", parents=[common], help="Track a backport to a version and all versions it implies")
     p.add_argument("pr", help="Source PR URL")
     p.add_argument("version", help="Version key, e.g. stable-25.8")
+    p.add_argument(
+        "--not-needed-from", metavar="X.Y",
+        help="Version from which the backport isn't needed; those versions are marked Not applicable",
+    )
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("remove", parents=[common], help="Stop tracking a version and what only it implied")

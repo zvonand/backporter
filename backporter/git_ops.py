@@ -266,6 +266,53 @@ def continue_cherry_pick(repo_dir: str, backport_branch: str) -> str:
     return PICKED
 
 
+def head_sha(repo_dir: str) -> str:
+    return run(["git", "rev-parse", "HEAD"], cwd=repo_dir).stdout.strip()
+
+
+def _commit(repo_dir: str, message: str, *extra: str) -> str:
+    """Commit the index with message (comment lines stripped); returns the new HEAD sha."""
+    result = subprocess.run(
+        ["git", "commit", "-q", "--cleanup=strip", "-F", "-", *extra], cwd=repo_dir, input=message,
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(result.stderr or result.stdout, file=sys.stderr)
+        raise RuntimeError("git commit failed")
+    return head_sha(repo_dir)
+
+
+def commit_conflicts(repo_dir: str, conflicts: list[tuple[str, str]]) -> str:
+    """Finish the in-progress cherry-pick by committing the conflicted files as they are (with markers)."""
+    msg_path = os.path.join(repo_dir, run(["git", "rev-parse", "--git-path", "MERGE_MSG"], cwd=repo_dir).stdout.strip())
+    message = open(msg_path).read() if os.path.exists(msg_path) else "Cherry-pick\n"
+    listing = "\n".join(f"- {path} ({kind})" for path, kind in conflicts)
+    message = f"{message.rstrip()}\n\nConflicts committed as-is; the next commit resolves them:\n{listing}\n"
+    run(["git", "add", "-A", "--", *[path for path, _ in conflicts]], cwd=repo_dir)
+    sha = _commit(repo_dir, message)
+    if is_cherry_pick_in_progress(repo_dir):
+        raise RuntimeError("cherry-pick still in progress after committing the conflicts")
+    return sha
+
+
+def commit_resolution(repo_dir: str, message: str) -> str:
+    """Commit all changes to tracked files as the resolution of the previous (conflict) commit."""
+    run(["git", "add", "-u"], cwd=repo_dir)
+    return _commit(repo_dir, message, "--allow-empty")
+
+
+def same_tree(repo_dir: str, ref: str) -> bool:
+    """True if HEAD has the same content as ref (the backport changes nothing)."""
+    return run_no_check(["git", "diff", "--quiet", ref, "HEAD"], cwd=repo_dir).returncode == 0
+
+
+def redo_pick(repo_dir: str, merge_sha: str) -> list[tuple[str, str]]:
+    """Drop the conflict commit and cherry-pick again, leaving the conflicts in progress for a human."""
+    run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo_dir)
+    run_no_check(["git", "cherry-pick", "-m", "1", merge_sha, "--no-edit"], cwd=repo_dir)
+    return get_conflicted_entries(repo_dir)
+
+
 def show_file(repo_dir: str, ref: str, path: str) -> str:
     """Contents of path at ref."""
     return run(["git", "show", f"{ref}:{path}"], cwd=repo_dir).stdout

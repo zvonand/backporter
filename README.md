@@ -22,6 +22,8 @@ Version keys look like `stable-25.8` or `antalya-26.3`. Each version has its own
 
 **Two starting versions.** Only needed when the stable and antalya starting points differ, e.g. antalya from 25.8 but stable only from 26.3. Pick one in **Version** and type the other key(s) in the row's **Note** cell, e.g. `stable-26.3`.
 
+**Not needed from newer versions.** If the change is known to be unnecessary from some version on (e.g. the code changed in 26.3), pick that version number in the request's **Not needed from** cell (empty = no limit). All implied versions from that number up, stable and antalya alike, get rows with Status `Not applicable` and "Not needed from 26.3 (per request by @…)" in Note. Rows that already exist are left as they are. The limit is stored on the explicit row, so versions added later with `add-version` are also created as `Not applicable` for that PR. A request whose own version is at or above its limit is skipped. On the command line: `backporter add <PR> <version> --not-needed-from 26.3`.
+
 **Requesting again.** A request never creates a duplicate row: if the PR is already tracked for a version, that row is kept as it is (an implied row becomes explicit). If the row was **Discarded**, a new request for that exact version clears its Decision (back to undecided), sets Requested by to the new requester, and writes "Previously discarded; requested again by @… on <date>" in Note. Implied versions that were discarded individually stay discarded.
 
 **What GitHub records.** Adding an upstream `ClickHouse/ClickHouse` PR to the project makes GitHub log "added to project" on that PR, and deleting the processed row may log "removed from project". These are project events. The backporter never writes to the upstream PR itself.
@@ -140,7 +142,7 @@ Everything else, including the list of versions, lives in the project.
 
 ## Safety: the only destination is Altinity/ClickHouse
 
-Source PRs may come from `ClickHouse/ClickHouse`, but the backporter only ever reads from it. It never writes anything there: no PRs, comments, reviews, labels, edits or issues. It also never comments anywhere, including in Altinity repos.
+Source PRs may come from `ClickHouse/ClickHouse`, but the backporter only ever reads from it. It never writes anything there: no PRs, comments, reviews, labels, edits or issues. Its only comment anywhere is the conflict summary on a backport PR it opened in `Altinity/ClickHouse` (see `start`).
 
 The target repo is hardcoded (`TARGET_REPO` in `backporter/config.py`) and is not configurable.
 
@@ -148,7 +150,9 @@ The target repo is hardcoded (`TARGET_REPO` in `backporter/config.py`) and is no
 - reads (`GET`/`HEAD`);
 - `POST /repos/Altinity/ClickHouse/pulls` (opening a backport PR);
 - `POST /repos/Altinity/ClickHouse/issues/<n>/labels` (adding the configured labels to it; labels are never removed or created);
-- a GraphQL mutation only if it is a single operation whose top-level fields are all project mutations: `createProjectV2Field`, `updateProjectV2Field`, `createProjectV2View`, `updateProjectV2View`, `deleteProjectV2View`, `addProjectV2DraftIssue`, `updateProjectV2ItemFieldValue`, `clearProjectV2ItemFieldValue`, `deleteProjectV2Item`. Fields are never deleted.
+- `POST /repos/Altinity/ClickHouse/issues/<n>/comments`, only for a backport PR the backporter just opened or reused (registered with the guard by number), for the AI conflict summary;
+- `POST /orgs/Altinity/projectsV2/<n>/views` (creating a project view; only this REST call can set a view's grouping);
+- a GraphQL mutation only if it is a single operation whose top-level fields are all project mutations: `createProjectV2Field`, `updateProjectV2Field`, `createProjectV2View`, `updateProjectV2View`, `deleteProjectV2View`, `addProjectV2DraftIssue`, `updateProjectV2ItemFieldValue`, `clearProjectV2ItemFieldValue`, `deleteProjectV2Item`, and `addProjectV2ItemById` only for a PR the code has just verified to be in `Altinity/ClickHouse` (registered with the guard by its node id). Fields are never deleted.
 
 Anything else is refused with an error. If the installed PyGithub doesn't have the request hook the guard needs, the tool refuses to start.
 
@@ -173,7 +177,7 @@ Example: with stable 25.3, 25.8, 26.3, 26.8 and antalya 25.8, 26.3, 26.6, 26.8, 
 
 ### Items
 
-Each item is a draft issue for one (source PR, version) pair. It is titled `[<version key>] <owner/repo>#<N> <source PR title>`, its body is the source PR URL, and it has these fields:
+Each item is one (source PR, version) pair. It starts as a draft titled `<owner/repo>#<N> <source PR title>`, with the source PR URL as its body. When a backport PR exists (opened by the backporter, or opened by hand and found by `scan`), the draft is **replaced by that PR itself**, with all field values copied. The Title column, which GitHub always shows first, then is the backport PR: clickable, with its state. Only `Altinity/ClickHouse` PRs are ever added this way. Fields:
 
 | Field | Meaning |
 |-------|---------|
@@ -191,12 +195,12 @@ Draft items can't have comments, so the explanation goes in `Note`. Notes and fo
 
 ### Views
 
-- One table view per version, named by its key and filtered with `version:"<key>"`. For example, open the `stable-25.8` view to see everything going into stable 25.8.
+- One table view per version, named by its key, filtered with `version:"<key>" has:requested` (tracked rows only, so unprocessed requests stay in `Requests`) and grouped by Status. For example, open the `stable-25.8` view to see everything going into stable 25.8. Grouping can only be set when a view is created (via the REST API), so views created by older versions of the backporter have to be recreated to get it.
 - `Requests`: the first tab, which the project opens with. It shows requests added in the web page that `scan` hasn't processed yet (filter `no:requested`), so a processed request disappears from it, replaced by tracked items in the version views. See [Requesting a backport](#requesting-a-backport). GitHub can't reorder tabs through the API, so `init` turns GitHub's default first view ("View 1") into `Requests`. If someone has already customized the first view, `init` leaves it alone and asks you to drag the `Requests` tab to the front.
-- `All`: a board of everything.
+- `All`: a board of all tracked rows (filter `has:requested`).
 
 `init` and `add-version` set up the columns of every view. Views created through the API would otherwise show only GitHub's defaults.
-- **Shown:** Decision, Status, Version, Requested, Requested by, Backport PR and Note. `Requests` gets only Version and Note (its rows are the PRs themselves), and the board's cards get Version and Decision.
+- **Shown:** Decision, Status, Version, Requested, Requested by and Note. Hidden in the tables: Backport PR, because a row with a backport PR is that PR, and Not needed from, which is set in requests; the rows it excludes are `Not applicable` with the reason in Note. `Requests` gets only Version and Note (its rows are the PRs themselves), and the board's cards get Version and Decision.
 - **Hidden:** the built-in Assignees, Linked pull requests and Sub-issues progress, which are always empty for draft items.
 - **Left alone:** other columns you turn on yourself.
 
@@ -305,14 +309,14 @@ It then continues with the next version.
 
 **Conflicts without `--ai`.** It sets Status `Conflicts`, prints the conflicted files, leaves the branch with conflicts in the clone dir, and stops (exit code 1). Versions after it are not started.
 
-**Conflicts with `--ai`.** The AI resolves them in the clone dir (see [AI conflict resolution](#ai-conflict-resolution)) and reports one outcome:
+**Conflicts with `--ai`.** The backporter first commits the cherry-pick **as-is, with the conflict markers**. That commit keeps the original message and adds "Conflicts committed as-is; the next commit resolves them" and the list of files. The AI then resolves the conflicts in the clone dir (see [AI conflict resolution](#ai-conflict-resolution)) and reports one outcome. A successful resolution becomes a **second, separate commit**, so reviewers see exactly what the AI changed.
 
 | AI outcome | What the backporter does |
 |---|---|
-| `RESOLVED` | Checks that it holds: HEAD hasn't moved, the cherry-pick is still in progress, nothing is unmerged and no conflict markers are left. Then it continues with steps 4–6 and writes `AI resolved conflicts: <note>` to `Note`. If the resolution leaves no changes, the item is marked `Already present` as above. |
+| `RESOLVED` | Checks that HEAD hasn't moved and no conflict markers are left, then commits the resolution ("Resolve conflicts in backport of #N" with the AI's note). It continues with steps 4–6, writes `AI resolved conflicts: <note>` to `Note`, and posts **one comment on the backport PR** with the conflicted files, the two commits and the AI's short summary of what conflicted and how it was resolved. If the branch ends up identical to the target branch, the item is marked `Already present` as above. |
 | `ALREADY_PRESENT` | Drops the branch and marks `Already present`, using the PR the AI names or, failing that, the lookup above. |
 | `NOT_APPLICABLE` | Drops the branch and marks `Not applicable` with the AI's reason in `Note`. |
-| `UNRESOLVED` | Sets `Conflicts` with the AI's reason in `Note`, leaves the conflicts for a human, and stops. |
+| `UNRESOLVED` | Undoes the conflict commit and redoes the cherry-pick, so the conflicts are in progress again for a human (`continue`). Sets `Conflicts` with the AI's reason in `Note`, and stops. |
 
 If the backport branch already exists locally, or the clone is in a conflicted/dirty state, it asks before recreating the branch from a clean target. Answering no aborts.
 
@@ -398,7 +402,7 @@ If neither the code nor the AI produces a valid body (or no AI is available, or 
   - `--safe-mode --strict-mcp-config --setting-sources ""`: no MCP servers, plugins, hooks or user/project permission rules;
   - `--permission-mode dontAsk`: only the listed tools are allowed. These are the same git and read commands as above, plus Read/Edit/Write/Glob/Grep limited to `./**`. `git push/commit/fetch/remote/config`, `gh`, `curl`, `wget`, `ssh`, web tools and credential directories are denied explicitly.
 
-In both modes the AI process gets no `GITHUB_TOKEN`/`GH_TOKEN`/`ANTHROPIC_API_KEY`, an empty `GH_CONFIG_DIR` (so `gh` is logged out), and `GIT_ALLOW_PROTOCOL=file` (so git can't reach any remote). The AI only edits and stages files. Committing, pushing, opening PRs and updating the project are done by the backporter under the safety rules above.
+In both modes the AI process gets no `GITHUB_TOKEN`/`GH_TOKEN`/`ANTHROPIC_API_KEY`, an empty `GH_CONFIG_DIR` (so `gh` is logged out), and `GIT_ALLOW_PROTOCOL=file` (so git can't reach any remote). The AI only edits and stages files. Committing (the conflict commit and the resolution commit), pushing, opening PRs, the summary comment and updating the project are done by the backporter under the safety rules above. Besides OUTCOME and NOTE, the AI ends its answer with a SUMMARY: 2-5 bullet points for reviewers, posted in the comment.
 
 ## Clone dirs
 

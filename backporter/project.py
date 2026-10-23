@@ -23,6 +23,8 @@ F_BACKPORT_PR = "Backport PR"
 F_NOTE = "Note"
 F_DECISION = "Decision"
 F_REQUESTED_BY = "Requested by"
+# Version number (e.g. "26.3") from which a backport is not needed, set in a request; empty = no limit.
+F_NOT_NEEDED_FROM = "Not needed from"
 
 NOT_STARTED = "Not started"
 CONFLICTS = "Conflicts"
@@ -49,8 +51,10 @@ DECISION_COLORS = {APPROVED: "BLUE", DISCARDED: "GRAY"}
 
 # Columns (cards, for boards) the backporter makes visible; views created via the API show only defaults.
 # Column order can't be set via the API: it follows field creation order.
-_TABLE_FIELDS = [F_DECISION, F_STATUS, F_VERSION, F_REQUESTED, F_REQUESTED_BY, F_BACKPORT_PR, F_NOTE]
-_REQUESTS_FIELDS = [F_VERSION, F_NOTE]
+# Backport PR isn't shown: once it exists, the row is that PR (its Title links to it). Not needed from is set in
+# requests only; rows it excludes are Not applicable with the reason in Note.
+_TABLE_FIELDS = [F_DECISION, F_STATUS, F_VERSION, F_REQUESTED, F_REQUESTED_BY, F_NOTE]
+_REQUESTS_FIELDS = [F_VERSION, F_NOT_NEEDED_FROM, F_NOTE]
 _BOARD_FIELDS = [F_VERSION, F_DECISION]
 REQUESTS_VIEW = "Requests"
 # Built-in columns that are always empty for draft items (in Requests also Status, and Source PR: the row is the PR).
@@ -60,6 +64,7 @@ REQUESTED_COLORS = {EXPLICIT: "GREEN", IMPLIED: "GRAY"}
 
 _OWN_FIELDS = {
     F_SOURCE_PR, F_VERSION, F_FLAVOR, F_REQUESTED, F_STATUS, F_BACKPORT_PR, F_NOTE, F_DECISION, F_REQUESTED_BY,
+    F_NOT_NEEDED_FROM,
 }
 _CUSTOM_FIELD_TYPES = {"TEXT", "SINGLE_SELECT", "MULTI_SELECT", "NUMBER", "DATE", "ITERATION"}
 
@@ -74,7 +79,7 @@ query($id: ID!) {
     ... on ProjectV2 {
       fields(first: 50) {
         nodes {
-          ... on ProjectV2FieldCommon { id name dataType }
+          ... on ProjectV2FieldCommon { id databaseId name dataType }
           ... on ProjectV2SingleSelectField { options { id name color description } }
         }
       }
@@ -128,18 +133,25 @@ class Item:
     note: str
     decision: str
     requested_by: str
+    not_needed_from: str
     # Who added the item to the project
     creator: str
 
 
+# Tracked rows only: unprocessed requests (no Requested value yet) belong in the Requests view.
+TRACKED_FILTER = "has:requested"
+
+
 def _version_filter(key: str) -> str:
-    return f'version:"{key}"'
+    return f'version:"{key}" {TRACKED_FILTER}'
 
 
 class Project:
-    def __init__(self, requester: Requester, project_id: str):
+    def __init__(self, requester: Requester, project_id: str, owner: str, number: int):
         self.requester = requester
         self.id = project_id
+        self.owner = owner
+        self.number = number
         self.fields: dict[str, dict] = {}
         self.views: dict[str, dict] = {}
         self._load_fields()
@@ -155,7 +167,7 @@ class Project:
         project = (data["data"]["repositoryOwner"] or {}).get("projectV2")
         if not project:
             raise RuntimeError(f"Project {owner}#{number} not found")
-        return cls(requester, project["id"])
+        return cls(requester, project["id"], owner, number)
 
     def _load_fields(self) -> None:
         for attempt in range(_READ_ATTEMPTS):
@@ -206,10 +218,12 @@ class Project:
         self._load_fields()
         self._ensure_requests_first()
         if "All" not in self.views:
-            self._create_view("All", "BOARD_LAYOUT", None)
+            self._create_view("All", "BOARD_LAYOUT", TRACKED_FILTER)
         for key in self.version_keys():
             if key not in self.views:
-                self._create_view(key, "TABLE_LAYOUT", _version_filter(key))
+                self._create_version_view(key)
+        self._fix_old_filters()
+        self._ensure_version_numbers()
         self._load_fields()
         self._show_fields()
 
@@ -229,9 +243,17 @@ class Project:
         else:
             self._update_options(field, [*field["options"], option])
         if version.key not in self.views:
-            self._create_view(version.key, "TABLE_LAYOUT", _version_filter(version.key))
+            self._create_version_view(version.key)
+        self._load_fields()
+        self._ensure_version_numbers()
         self._load_fields()
         self._show_fields()
+
+    def _ensure_version_numbers(self) -> None:
+        """'Not needed from' offers every version number in the project; it needs at least one option."""
+        numbers = sorted({key.split("-", 1)[1] for key in self.version_keys()}, key=lambda n: tuple(map(int, n.split("."))))
+        if numbers:
+            self._ensure_single_select(F_NOT_NEEDED_FROM, {n: "GRAY" for n in numbers}, exact=False)
 
     def _create_field(self, name: str, data_type: str, options: list[dict] | None = None) -> None:
         payload = {"projectId": self.id, "dataType": data_type, "name": name}
@@ -303,7 +325,12 @@ class Project:
                 wanted = _BOARD_FIELDS
             else:
                 wanted = _TABLE_FIELDS
-            hidden = _HIDDEN_FIELDS | ({F_STATUS, F_SOURCE_PR} if view["name"] == REQUESTS_VIEW else set())
+            if view["name"] == REQUESTS_VIEW:
+                hidden = _HIDDEN_FIELDS | {F_STATUS, F_SOURCE_PR}
+            elif view["layout"] == "TABLE_LAYOUT":
+                hidden = _HIDDEN_FIELDS | {F_BACKPORT_PR, F_NOT_NEEDED_FROM}
+            else:
+                hidden = _HIDDEN_FIELDS
             shown = [f for f in view["fields"]["nodes"] if f]
             visible = [f["id"] for f in shown if f["name"] not in hidden]
             missing = [self.fields[n]["id"] for n in wanted if n in self.fields and self.fields[n]["id"] not in visible]
@@ -314,6 +341,39 @@ class Project:
                     "clientMutationId",
                 )
                 print(f"Updated columns of view '{view['name']}'")
+
+    def _create_version_view(self, key: str) -> None:
+        """
+        A table view of one version, grouped by Status. Grouping can only be set when a view is created,
+        and only via the REST API (GraphQL has no group-by input).
+        """
+        columns = ["Title", *_TABLE_FIELDS]
+        self.requester.requestJsonAndCheck(
+            "POST",
+            f"/orgs/{self.owner}/projectsV2/{self.number}/views",
+            headers={"X-GitHub-Api-Version": "2026-03-10"},
+            input={
+                "name": key,
+                "layout": "table",
+                "filter": _version_filter(key),
+                "visible_fields": [self.fields[n]["databaseId"] for n in columns if n in self.fields],
+                "group_by": [self.fields[F_STATUS]["databaseId"]],
+            },
+        )
+        print(f"Created view '{key}' (grouped by Status)")
+
+    def _fix_old_filters(self) -> None:
+        """Views created before TRACKED_FILTER also showed unprocessed requests; add it to their default filter."""
+        self._load_fields()
+        old = {key: f'version:"{key}"' for key in self.version_keys()} | {"All": ""}
+        for name, filter_ in old.items():
+            view = self.views.get(name)
+            if view and (view["filter"] or "") == filter_:
+                new = _version_filter(name) if name != "All" else TRACKED_FILTER
+                self.requester.graphql_named_mutation(
+                    "updateProjectV2View", {"viewId": view["id"], "filter": new}, "clientMutationId"
+                )
+                print(f"Updated the filter of view '{name}' to '{new}'")
 
     def _create_view(self, name: str, layout: str, filter_: str | None) -> None:
         _, out = self.requester.graphql_named_mutation(
@@ -363,6 +423,7 @@ class Project:
                     note=values.get(F_NOTE, ""),
                     decision=values.get(F_DECISION, ""),
                     requested_by=values.get(F_REQUESTED_BY, ""),
+                    not_needed_from=values.get(F_NOT_NEEDED_FROM, ""),
                     creator=(node.get("creator") or {}).get("login", ""),
                 ))
             if not page["pageInfo"]["hasNextPage"]:
@@ -402,6 +463,13 @@ class Project:
             {"projectId": self.id, "itemId": item_id, "fieldId": field["id"], "value": v},
             "clientMutationId",
         )
+
+    def add_existing_item(self, content_id: str) -> str:
+        """Add an existing issue/PR (by node id) to the project; returns the item id."""
+        _, out = self.requester.graphql_named_mutation(
+            "addProjectV2ItemById", {"projectId": self.id, "contentId": content_id}, "item { id }"
+        )
+        return out["item"]["id"]
 
     def delete_item(self, item_id: str) -> None:
         self.requester.graphql_named_mutation(
