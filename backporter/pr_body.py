@@ -1,5 +1,6 @@
 """
-Body of a backport PR: the target branch's PR template with only two regions filled from the source PR.
+Body of a backport PR: the PR template of Altinity/ClickHouse's current default branch, whatever the target
+branch, with only two regions filled from the source PR.
 
 - Changelog category: the template's list of choices is replaced by the one category the source PR selected,
   copied verbatim (list marker and parenthetical included).

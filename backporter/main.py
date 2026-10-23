@@ -167,17 +167,20 @@ def not_needed_note(bound: str, requested_by: str) -> str:
     return f"Not needed from {bound} (per request by @{requested_by})"
 
 
-def backport_body(repo_dir: str, version: Version, pr: PullRequest) -> str:
+def backport_body(repo: Repository, pr: PullRequest) -> str:
     """
-    The target branch's PR template with the source PR's changelog category and entry (see pr_body).
-    The AI fills them only when the source is unclear. Raises pr_body.Unclear/TemplateError if a human is needed.
+    The PR template of repo's current default branch with the source PR's changelog category and entry
+    (see pr_body). The AI fills them only when the source is unclear.
+    Raises pr_body.Unclear/TemplateError if a human is needed.
     """
     if not pr.user:
         raise pr_body.Unclear("the source PR has no author")
     try:
-        template = git_ops.show_file(repo_dir, version.branch, pr_body.TEMPLATE_PATH)
-    except RuntimeError:
-        raise pr_body.TemplateError(f"{pr_body.TEMPLATE_PATH} not found on {version.branch}")
+        template = repo.get_contents(pr_body.TEMPLATE_PATH, ref=repo.default_branch).decoded_content.decode()
+    except GithubException as e:
+        raise pr_body.TemplateError(
+            f"can't read {pr_body.TEMPLATE_PATH} from {repo.full_name}@{repo.default_branch}: {e.status}"
+        )
     try:
         return pr_body.build(template, pr.body or "", pr.html_url, pr.user.login)
     except pr_body.Unclear as e:
@@ -472,18 +475,18 @@ def finish_backport(
     False, with nothing pushed, if the PR body needs a human.
     """
     branch = backport_branch(version, pr.number)
+    repo = gh.get_repo(TARGET_REPO)
+    # get_repo follows renames/redirects; never open a PR anywhere but TARGET_REPO.
+    if repo.full_name.lower() != TARGET_REPO.lower():
+        raise RuntimeError(f"Refusing to open a PR in {repo.full_name}; only {TARGET_REPO} is allowed")
     try:
-        body = backport_body(repo_dir, version, pr)
+        body = backport_body(repo, pr)
     except (pr_body.Unclear, pr_body.TemplateError) as e:
         project.set_value(item.id, F_NOTE, f"PR body needs a human: {e}")
         project.set_value(item.id, F_STATUS, CONFLICTS)
         print(f"PR body needs a human: {e}. Nothing pushed; the branch {branch} stays in {repo_dir}.", file=sys.stderr)
         return False
     git_ops.push(repo_dir, branch, TARGET_REPO)
-    repo = gh.get_repo(TARGET_REPO)
-    # get_repo follows renames/redirects; never open a PR anywhere but TARGET_REPO.
-    if repo.full_name.lower() != TARGET_REPO.lower():
-        raise RuntimeError(f"Refusing to open a PR in {repo.full_name}; only {TARGET_REPO} is allowed")
     owner = TARGET_REPO.split("/")[0]
     existing = list(repo.get_pulls(state="open", head=f"{owner}:{branch}"))
     if existing:

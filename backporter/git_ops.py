@@ -313,11 +313,6 @@ def redo_pick(repo_dir: str, merge_sha: str) -> list[tuple[str, str]]:
     return get_conflicted_entries(repo_dir)
 
 
-def show_file(repo_dir: str, ref: str, path: str) -> str:
-    """Contents of path at ref."""
-    return run(["git", "show", f"{ref}:{path}"], cwd=repo_dir).stdout
-
-
 def push(repo_dir: str, branch: str, target_repo: str) -> None:
     check_origin(repo_dir, target_repo)
     print(f"Pushing {branch} to {target_repo}...")

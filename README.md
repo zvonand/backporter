@@ -375,12 +375,12 @@ Prints the PR's selected Changelog category and its entry with attribution, exac
 
 ## PR body
 
-A backport PR's body is the **target branch's own `.github/PULL_REQUEST_TEMPLATE.md`**, read from the clone, with exactly two regions filled from the source PR:
+A backport PR's body is the **`.github/PULL_REQUEST_TEMPLATE.md` of Altinity/ClickHouse's current default branch**, whatever the target branch. The default branch is looked up on GitHub and the template read through the GitHub API on every backport; the target branch's or the clone's template is never used. The body has exactly two regions filled from the source PR:
 
 - **Changelog category:** the template's list of choices is replaced by the one category the source PR selected, copied verbatim (list marker and parenthetical included, no reclassification).
 - **Changelog entry:** the template's placeholder is replaced by the source PR's entry, copied verbatim, with ` (<source PR URL> by @<author login>)` appended to its last line.
 
-Everything else stays byte-for-byte as in the template, in particular the **CI/CD options and their checkbox states**, which are each branch's defaults. To change what CI runs for backports into a branch, change that branch's template. Nothing else is copied from the source PR.
+Everything else stays byte-for-byte as in the template, in particular the **CI/CD options and their checkbox states**, so every backport gets the default branch's current CI/CD defaults. Nothing else is copied from the source PR, including its CI/CD selections.
 
 **Unclear source PR.** The code handles the normal case. The AI ([AI conflict resolution](#ai-conflict-resolution) explains which backend) gets a prompt with the template, the source PR body and these same rules when:
 - the source PR selects no category or several;
@@ -391,7 +391,7 @@ Everything else stays byte-for-byte as in the template, in particular the **CI/C
 
 The AI either returns a body or says why it can't. Its body is accepted only if it's the template with nothing changed except one category line and an entry ending in the attribution.
 
-If neither the code nor the AI produces a valid body (or no AI is available, or the template is missing), **nothing is pushed**. The item gets Status `Conflicts` with `PR body needs a human: <reason>` in `Note`, and the backport branch stays in the clone.
+If neither the code nor the AI produces a valid body (or no AI is available, or the template can't be read from the default branch), **nothing is pushed**. The item gets Status `Conflicts` with `PR body needs a human: <reason>` in `Note`, and the backport branch stays in the clone.
 
 ## AI conflict resolution
 
