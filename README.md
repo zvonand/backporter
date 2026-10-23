@@ -127,6 +127,7 @@ The token is used for the GitHub API only. `git fetch`/`git push` in the clone d
 
   With this config, a backport into `antalya-25.8` gets `backport`, `antalya` and `antalya-25.8`, and one into `stable-25.8` gets `backport`, `stable`, `25.8` and `stable-25.8`. The committed config follows the team's backport PR convention for every version. Labels must already exist in `Altinity/ClickHouse`; the backporter never creates them. `start` and `continue` check this before any git work and stop on a missing label.
 
+- `[builds]`: the team's builds projects that backport PRs are also added to, once, per flavor: project number, the text field that gets the version number, and the Status for a newly added open PR. Currently stable goes to project 26 (Stable Builds, "Port Versions") and antalya to project 17 (Project Antalya, "Release Versions (Major)"), both with Status "Needs Review".
 - `[branches]`: the branch in `Altinity/ClickHouse` for each version key. Branch names don't follow one pattern, so each is listed explicitly:
 
   ```toml
@@ -278,7 +279,7 @@ backporter scan [--version KEY]
 ```
 
 1. Processes requests added in the web page (see [Requesting a backport](#requesting-a-backport)): each requested version is handled like `add`, then the request row is deleted.
-2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`, and not `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>`, so backports opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`), and turns a draft row into that PR's row.
+2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`, and not `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>`, so backports opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`), turns a draft row into that PR's row, and adds the PR to its builds project if it isn't there yet. A merged PR is added without a Status; a closed one isn't added.
 3. Lists items still `Not started` or in `Conflicts`, grouped by version, with their Decision. `Discarded` items are left out.
 4. Reports PRs that are missing versions implied by their explicit requests.
 
@@ -298,6 +299,7 @@ Backports a merged PR right away. Running it counts as the decision, so no appro
 4. Pushes the branch to `origin`.
 5. Opens a PR into the target branch titled `<Stable|Antalya> X.Y Backport of #N - <exact source PR title>`, with the labels configured for its version (see Configuration). If an open PR already exists for the branch, it is reused. The body is built before anything is pushed (see [PR body](#pr-body)).
 6. Replaces the draft row by the backport PR (same field values), and sets `Backport PR` and Status `PR open`.
+7. Adds the backport PR to its flavor's builds project (see `[builds]`), unless it's already there: the version number goes in that project's version field, and Status is set to the configured one (e.g. "Needs Review"). Nothing there is changed afterwards; QA and release status stay with people.
 
 **Already present.** If the cherry-pick turns out empty, the change is already in the target branch. The tool then:
 1. Drops the local backport branch.

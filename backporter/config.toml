@@ -14,6 +14,18 @@ project_number = 39
 "antalya-26.6" = "antalya-26.6"
 "antalya-26.8" = "antalya-26.8"
 
+# Backport PRs are also added (once) to the team's builds projects, with the version number in the given
+# text field. Open PRs get `status`; merged ones are added without a Status; closed ones aren't added.
+[builds.stable]
+project = 26                         # Stable Builds
+version_field = "Port Versions"
+status = "Needs Review"
+
+[builds.antalya]
+project = 17                         # Project Antalya
+version_field = "Release Versions (Major)"
+status = "Needs Review"
+
 [run]
 # AI conflict resolution in `backporter run` (`--no-ai` turns it off for one run).
 ai = true

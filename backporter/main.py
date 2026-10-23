@@ -126,6 +126,37 @@ def promote(project: Project, item: Item, backport: PullRequest) -> None:
     print(f"    the row is now {backport.html_url}")
 
 
+_builds_projects: dict[int, Project] = {}
+
+
+def sync_builds(gh: Github, config: Config, version: Version, backport: PullRequest) -> None:
+    """Add the backport PR to its flavor's builds project once, with the version number (see [builds])."""
+    build = config.builds.get(version.flavor)
+    if not build or (backport.state == "closed" and not backport.merged_at):
+        return
+    _, data = gh.requester.graphql_query(
+        """query($id: ID!) { node(id: $id) { ... on PullRequest {
+             projectItems(first: 50) { nodes { project { number owner { ... on Organization { login } } } } } } } }""",
+        {"id": backport.node_id},
+    )
+    for node in data["data"]["node"]["projectItems"]["nodes"]:
+        if node["project"]["number"] == build.project and node["project"]["owner"].get("login") == config.project_owner:
+            return
+    if build.project not in _builds_projects:
+        _builds_projects[build.project] = Project.open(gh.requester, config.project_owner, build.project)
+    project = _builds_projects[build.project]
+    if project.fields.get(build.version_field, {}).get("dataType") != "TEXT":
+        print(f"Builds project {build.project} has no text field '{build.version_field}'; not added", file=sys.stderr)
+        return
+    github_guard.allow_project_content(backport.node_id)
+    item_id = project.add_existing_item(backport.node_id)
+    number = f"{version.version[0]}.{version.version[1]}"
+    project.set_value(item_id, build.version_field, number)
+    if build.status and not backport.merged_at:
+        project.set_value(item_id, F_STATUS, build.status)
+    print(f"    added {backport.html_url} to project {build.project} ({build.version_field} = {number})")
+
+
 def version_number(number: str) -> tuple[int, int]:
     """'26.3' -> (26, 3)"""
     major, minor = number.split(".")
@@ -396,6 +427,7 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
             continue
         status = MERGED if pr.merged_at else CLOSED if pr.state == "closed" else PR_OPEN
         promote(project, item, pr)
+        sync_builds(gh, config, version, pr)
         if pr.html_url != item.backport_pr:
             project.set_value(item.id, F_BACKPORT_PR, pr.html_url)
             item.backport_pr = pr.html_url
@@ -475,6 +507,7 @@ def finish_backport(
         backport.create_issue_comment(comment)
     print("Updating the project...")
     promote(project, item, backport)
+    sync_builds(gh, config, version, backport)
     project.set_value(item.id, F_BACKPORT_PR, backport.html_url)
     project.set_value(item.id, F_STATUS, PR_OPEN)
     print(f"{version.key}: {backport.html_url}")

@@ -59,6 +59,16 @@ def find_version(versions: list[Version], key: str) -> Version:
 
 
 @dataclass
+class Build:
+    """A builds project that backport PRs of one flavor are added to (once)."""
+    project: int
+    # Text field that gets the version number, e.g. "26.3"
+    version_field: str
+    # Status for a newly added open PR; empty = leave unset
+    status: str
+
+
+@dataclass
 class Config:
     project_owner: str
     project_number: int
@@ -68,6 +78,8 @@ class Config:
     branches: dict[str, str]
     # AI conflict resolution in `backporter run`
     run_ai: bool
+    # flavor -> builds project
+    builds: dict[str, Build]
 
     def labels_for(self, version: Version) -> list[str]:
         """Labels for a backport PR into version: 'all', then its flavor's, then its own."""
@@ -107,7 +119,12 @@ def load_config(path: str = CONFIG_PATH) -> Config:
     run_ai = data.get("run", {}).get("ai", True)
     if not isinstance(run_ai, bool):
         raise ValueError(f"{path}: run.ai must be true or false")
-    return Config(data.get("project_owner", ""), data.get("project_number", 0), labels, branches, run_ai)
+    builds = {}
+    for flavor, b in data.get("builds", {}).items():
+        if flavor not in FLAVORS or not isinstance(b.get("project"), int) or not b.get("version_field"):
+            raise ValueError(f"{path}: builds.{flavor} needs a flavor key, an integer project and a version_field")
+        builds[flavor] = Build(b["project"], b["version_field"], b.get("status", ""))
+    return Config(data.get("project_owner", ""), data.get("project_number", 0), labels, branches, run_ai, builds)
 
 
 def save_project(owner: str, number: int, path: str = CONFIG_PATH) -> None:
