@@ -379,6 +379,13 @@ class Project:
             self.set_value(item_id, name, value)
         return item_id
 
+    def clear_value(self, item_id: str, field_name: str) -> None:
+        self.requester.graphql_named_mutation(
+            "clearProjectV2ItemFieldValue",
+            {"projectId": self.id, "itemId": item_id, "fieldId": self.fields[field_name]["id"]},
+            "clientMutationId",
+        )
+
     def set_value(self, item_id: str, field_name: str, value: str) -> None:
         field = self.fields.get(field_name)
         if field is None:

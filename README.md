@@ -22,6 +22,8 @@ Version keys look like `stable-25.8` or `antalya-26.3`. Each version has its own
 
 **Two starting versions.** Only needed when the stable and antalya starting points differ, e.g. antalya from 25.8 but stable only from 26.3. Pick one in **Version** and type the other key(s) in the row's **Note** cell, e.g. `stable-26.3`.
 
+**Requesting again.** A request never creates a duplicate row: if the PR is already tracked for a version, that row is kept as it is (an implied row becomes explicit). If the row was **Discarded**, a new request for that exact version clears its Decision (back to undecided), sets Requested by to the new requester, and writes "Previously discarded; requested again by @… on <date>" in Note. Implied versions that were discarded individually stay discarded.
+
 **What GitHub records.** Adding an upstream `ClickHouse/ClickHouse` PR to the project makes GitHub log "added to project" on that PR, and deleting the processed row may log "removed from project". These are project events. The backporter never writes to the upstream PR itself.
 
 **Alternative: a draft row, which leaves nothing on the upstream PR.** Type the version key(s), e.g. `stable-25.8`, and press **Cmd+Enter** (Ctrl+Enter on Linux/Windows). Then open the draft and paste the PR link into its body. Plain Enter on typed text creates a real issue instead ([GitHub changelog](https://github.blog/changelog/2025-02-18-github-issues-projects-february-18th-update/)).
@@ -146,7 +148,7 @@ The target repo is hardcoded (`TARGET_REPO` in `backporter/config.py`) and is no
 - reads (`GET`/`HEAD`);
 - `POST /repos/Altinity/ClickHouse/pulls` (opening a backport PR);
 - `POST /repos/Altinity/ClickHouse/issues/<n>/labels` (adding the configured labels to it; labels are never removed or created);
-- a GraphQL mutation only if it is a single operation whose top-level fields are all project mutations: `createProjectV2Field`, `updateProjectV2Field`, `createProjectV2View`, `updateProjectV2View`, `deleteProjectV2View`, `addProjectV2DraftIssue`, `updateProjectV2ItemFieldValue`, `deleteProjectV2Item`. Fields are never deleted.
+- a GraphQL mutation only if it is a single operation whose top-level fields are all project mutations: `createProjectV2Field`, `updateProjectV2Field`, `createProjectV2View`, `updateProjectV2View`, `deleteProjectV2View`, `addProjectV2DraftIssue`, `updateProjectV2ItemFieldValue`, `clearProjectV2ItemFieldValue`, `deleteProjectV2Item`. Fields are never deleted.
 
 Anything else is refused with an error. If the installed PyGithub doesn't have the request hook the guard needs, the tool refuses to start.
 

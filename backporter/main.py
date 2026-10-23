@@ -18,6 +18,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from datetime import date
 
 from github import Github, GithubException
 from github.PullRequest import PullRequest
@@ -31,7 +32,7 @@ from backporter.config import (
 )
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
-    APPROVED, DISCARDED, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
+    APPROVED, DISCARDED, F_DECISION, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -194,10 +195,23 @@ def track(
         requested = EXPLICIT if v == target else IMPLIED
         item = existing.get(v.key)
         if item:
-            if requested == EXPLICIT and item.requested != EXPLICIT:
+            if requested == EXPLICIT and item.decision == DISCARDED:
+                # A new request overrides an earlier discard; the Note keeps that history visible.
+                project.clear_value(item.id, F_DECISION)
                 project.set_value(item.id, F_REQUESTED, EXPLICIT)
                 project.set_value(item.id, F_REQUESTED_BY, requested_by)
+                project.set_value(
+                    item.id, F_NOTE, f"Previously discarded; requested again by @{requested_by} on {date.today()}"
+                )
+                item.decision, item.requested, item.requested_by = "", EXPLICIT, requested_by
+                print(f"{v.key}: was discarded; requested again, Decision cleared")
+            elif requested == EXPLICIT and item.requested != EXPLICIT:
+                project.set_value(item.id, F_REQUESTED, EXPLICIT)
+                project.set_value(item.id, F_REQUESTED_BY, requested_by)
+                item.requested, item.requested_by = EXPLICIT, requested_by
                 print(f"{v.key}: marked explicit")
+            elif requested == EXPLICIT:
+                print(f"{v.key}: already requested ({item.status})")
             continue
         created.append(create_item(project, v, url, f"{pr_repo}#{number} {pr.title}", requested, requested_by))
 

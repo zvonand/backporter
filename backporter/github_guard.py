@@ -26,6 +26,7 @@ ALLOWED_MUTATIONS = {
     "deleteProjectV2View",
     "addProjectV2DraftIssue",
     "updateProjectV2ItemFieldValue",
+    "clearProjectV2ItemFieldValue",
     "deleteProjectV2Item",
 }
 
