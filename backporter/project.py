@@ -36,6 +36,7 @@ NOT_APPLICABLE = "Not applicable"
 
 # Decision is set by people in the web page; empty means undecided.
 APPROVED = "Approved"
+# Also a Status: scan moves discarded rows that have nothing on GitHub yet into it.
 DISCARDED = "Discarded"
 
 EXPLICIT = "explicit"
@@ -43,7 +44,7 @@ IMPLIED = "implied"
 
 STATUS_COLORS = {
     NOT_STARTED: "GRAY", CONFLICTS: "RED", PR_OPEN: "YELLOW", MERGED: "GREEN", CLOSED: "PURPLE",
-    PRESENT: "GREEN", NOT_APPLICABLE: "GRAY",
+    PRESENT: "GREEN", NOT_APPLICABLE: "GRAY", DISCARDED: "GRAY",
 }
 # Statuses the backporter never changes again.
 FINAL_STATUSES = (MERGED, CLOSED, PRESENT, NOT_APPLICABLE)
@@ -145,6 +146,8 @@ REQUESTS_FILTER = "no:requested"
 ACTIVE_FILTER = (
     f"{TRACKED_FILTER} -status:" + ",".join(f'"{s}"' for s in FINAL_STATUSES) + f" -decision:{DISCARDED}"
 )
+# Discarded rows still to be moved to Status Discarded.
+TO_DISCARD_FILTER = f'{TRACKED_FILTER} decision:{DISCARDED} status:"{NOT_STARTED}","{CONFLICTS}"'
 
 
 def source_filter(urls: list[str]) -> str:

@@ -39,7 +39,7 @@ from backporter.config import (
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
     APPROVED, DISCARDED, F_DECISION, F_NOT_NEEDED_FROM, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
-    ACTIVE_FILTER, REQUESTS_FILTER, TRACKED_FILTER, source_filter,
+    ACTIVE_FILTER, REQUESTS_FILTER, TO_DISCARD_FILTER, TRACKED_FILTER, source_filter,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -400,6 +400,9 @@ def track(
             if requested == EXPLICIT and item.decision == DISCARDED:
                 # A new request overrides an earlier discard; the Note keeps that history visible.
                 project.clear_value(item.id, F_DECISION)
+                if item.status == DISCARDED:
+                    project.set_value(item.id, F_STATUS, NOT_STARTED)
+                    item.status = NOT_STARTED
                 project.set_value(item.id, F_REQUESTED, EXPLICIT)
                 project.set_value(item.id, F_REQUESTED_BY, requested_by)
                 project.set_value(
@@ -521,9 +524,18 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
         find_version(version_list, only_version)
     versions = {v.key: v for v in version_list}
     repo = gh.get_repo(TARGET_REPO)
+    for item in tracked_items(project, TO_DISCARD_FILTER):
+        project.set_value(item.id, F_STATUS, DISCARDED)
+        print(f"{item.version} {item.source_pr}: {item.status} -> {DISCARDED}", flush=True)
     items = tracked_items(project, ACTIVE_FILTER)
     listed = {i.id for i in items}
     items += [i for i in created if i.id not in listed]
+    # Status Discarded whose Decision is no longer Discarded (the active rows exclude Decision Discarded).
+    for item in items:
+        if item.status == DISCARDED:
+            project.set_value(item.id, F_STATUS, NOT_STARTED)
+            print(f"{item.version} {item.source_pr}: no longer discarded; {DISCARDED} -> {NOT_STARTED}", flush=True)
+            item.status = NOT_STARTED
 
     to_refresh = [
         i for i in items
