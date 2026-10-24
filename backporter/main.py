@@ -1005,10 +1005,13 @@ def cmd_inspect(args, gh: Github, config: Config) -> None:
     dirs = load_dirs(args.dirs, versions)
     if reason := ai.unavailable():
         raise RuntimeError(reason)
+
+    def inspectable(i: Item) -> bool:
+        return i.status == PR_OPEN and bool(i.backport_pr) and i.decision != DISCARDED
+
     items = [
         i for i in tracked_items(project)
-        if i.status == PR_OPEN and i.backport_pr and i.decision != DISCARDED
-        and (not args.version or i.version == args.version)
+        if inspectable(i) and (not args.version or i.version == args.version)
     ]
     if not items:
         print("No open backport PRs.")
@@ -1023,6 +1026,14 @@ def cmd_inspect(args, gh: Github, config: Config) -> None:
             print(f"No clone dir or no [cmake] entry for {item.version}; skipped", file=sys.stderr)
             continue
         try:
+            # The project may have changed during earlier inspections.
+            item = next((i for i in project.items() if i.id == item.id), None)
+            if item is None:
+                print("No longer in the project; skipped")
+                continue
+            if not inspectable(item):
+                print(f"Now {item.status}{', ' + item.decision if item.decision else ''} in the project; skipped")
+                continue
             if not inspect_pr(gh, project, config, item, find_version(versions, item.version), dirs[item.version]):
                 failed = True
         except (RuntimeError, ValueError, GithubException, OSError) as e:
