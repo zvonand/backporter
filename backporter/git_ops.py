@@ -4,6 +4,7 @@ Git and GitHub helpers for cherry-picking a merged PR, or merging an upstream re
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -410,8 +411,26 @@ def checkout_pr_branch(repo_dir: str, target_repo: str, target_branch: str, bran
         local = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo_dir).stdout.strip()
         if local != sha and not prompt_yes_no(f"Local branch '{branch}' differs from origin. Reset it to origin?"):
             raise RuntimeError("Aborted")
+    remove_colliding_submodules(repo_dir, sha)
     run(["git", "checkout", "-B", branch, sha], cwd=repo_dir)
     return run(["git", "merge-base", f"refs/remotes/origin/{target_branch}", "HEAD"], cwd=repo_dir).stdout.strip()
+
+
+def remove_colliding_submodules(repo_dir: str, sha: str) -> None:
+    """
+    Deinit submodules left in the clone (no longer submodules at sha) whose path sha has files at: their work
+    tree and .git/config section go, their repository in .git/modules stays. Other leftovers are kept.
+    """
+    out = run_no_check(["git", "config", "--get-regexp", r"^submodule\..*\.url$"], cwd=repo_dir).stdout
+    for line in out.splitlines():
+        name = line.split(" ", 1)[0][len("submodule."):-len(".url")]
+        entry = run(["git", "ls-tree", sha, "--", name], cwd=repo_dir).stdout
+        if not entry or entry.startswith("160000 "):
+            continue
+        print(f"Removing submodule {name}: {sha[:12]} has files there")
+        if os.path.exists(os.path.join(repo_dir, name, ".git")):
+            shutil.rmtree(os.path.join(repo_dir, name))
+        run(["git", "config", "--remove-section", f"submodule.{name}"], cwd=repo_dir)
 
 
 def discard_changes(repo_dir: str) -> None:

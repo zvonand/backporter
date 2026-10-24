@@ -99,7 +99,24 @@ def failures(repo: Repository, pr_number: int, sha: str) -> list[Failure] | None
 
 def update_submodules(repo_dir: str) -> None:
     print("Updating submodules...")
-    git_ops.run(["sh", "contrib/update-submodules.sh"], cwd=repo_dir, stream=True)
+    _drop_sparse_checkout(repo_dir)
+    git_ops.run(["git", "submodule", "update", "--init"], cwd=repo_dir, stream=True)
+
+
+def _drop_sparse_checkout(repo_dir: str) -> None:
+    """
+    Undo contrib/sparse-checkout/setup-sparse-checkout.sh of older branches' contrib/update-submodules.sh
+    (submodule update commands in .git/config, sparse submodule work trees), if it was ever run in the clone.
+    """
+    out = git_ops.run_no_check(["git", "config", "--get-regexp", r"^submodule\..*\.update$"], cwd=repo_dir).stdout
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if not value.startswith("!../sparse-checkout/"):
+            continue
+        git_ops.run(["git", "config", "--unset-all", key], cwd=repo_dir)
+        path = os.path.join(repo_dir, key[len("submodule."):-len(".update")])
+        if os.path.exists(os.path.join(path, ".git")):
+            git_ops.run(["git", "sparse-checkout", "disable"], cwd=path)
 
 
 def _tee(cmd: list[str], cwd: str, env: dict[str, str], log_path: str) -> int:
