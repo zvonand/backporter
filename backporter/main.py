@@ -916,6 +916,9 @@ def inspect_pr(gh: Github, project: Project, config: Config, item: Item, version
     repo = gh.get_repo(TARGET_REPO)
     pr = repo.get_pull(git_ops.parse_pr_url(item.backport_pr)[1])
     branch = backport_branch(version, item.source_pr)
+    print(f"{pr.title}\n  source: {item.source_pr}\n  branch: {pr.head.ref} -> {pr.base.ref}, head {pr.head.sha[:12]}")
+    if item.note:
+        print(f"  note: {item.note}")
     if pr.state != "open":
         print(f"{pr.html_url} is {'merged' if pr.merged else pr.state}; skipped (`backporter scan` updates it)")
         return True
@@ -927,6 +930,7 @@ def inspect_pr(gh: Github, project: Project, config: Config, item: Item, version
     if item.note.startswith(marker):
         print(f"Already inspected: {item.note}")
         return True
+    print(f"Reading CI checks of {sha[:12]}...")
     failures = ci.failures(repo, pr.number, sha)
     if failures is None:
         print(f"CI hasn't finished on {sha[:12]}; skipped")
@@ -935,23 +939,29 @@ def inspect_pr(gh: Github, project: Project, config: Config, item: Item, version
         print(f"No failed checks on {sha[:12]}")
         return True
     checks = ", ".join(f.check for f in failures)
-    print(f"Failed checks on {sha[:12]}: {checks}")
+    details = "\n\n".join(f"### {f.check} ({f.url})\n{f.details}" for f in failures)
+    print(f"Failed checks on {sha[:12]}: {checks}\n\n{details}\n")
     source = load_source(gh, item.source_pr)
+    print(f"Checking out {branch} in {repo_dir}...")
     merge_base = git_ops.checkout_pr_branch(repo_dir, TARGET_REPO, version.branch, branch, sha)
+    print(f"Merge base with {version.branch}: {merge_base[:12]}")
     try:
         ci.update_submodules(repo_dir)
-        details = "\n\n".join(f"### {f.check} ({f.url})\n{f.details}" for f in failures)
         prompt = ai.build_ci_prompt(
             repo_dir, version.branch, branch, pr.html_url, pr.title, source.subject, source.url, merge_base, details,
         )
         build_dir = os.path.join(repo_dir, f"build-{version.key}")
         for attempt in range(1, BUILD_ATTEMPTS + 1):
+            print(f"\nAI attempt {attempt}/{BUILD_ATTEMPTS}...")
             result = ai.fix_ci(repo_dir, prompt)
+            if result.summary:
+                print(f"AI summary:\n{result.summary}")
             if result.outcome != ai.FIXED:
                 break
             if git_ops.index_matches_head(repo_dir):
                 result = ai.Result(ai.UNRESOLVED, "AI reported fixed, but changed nothing")
                 break
+            print(f"AI's changes:\n{git_ops.run(['git', 'diff', 'HEAD', '--stat'], cwd=repo_dir).stdout}")
             errors = ci.build(repo_dir, build_dir, config.cmake[version.key])
             if errors is None:
                 break
@@ -973,18 +983,21 @@ def inspect_pr(gh: Github, project: Project, config: Config, item: Item, version
             verdict, note = "Unrelated to this PR", f"{marker} unrelated: {result.note}"
         else:
             verdict, note = "Needs a human", f"{marker} needs a human: {result.note}"
+        print(f"Commenting on {pr.html_url}...")
         github_guard.allow_comment(pr.number)
         pr.create_issue_comment(ci_comment(sha, failures, verdict, result))
         project.set_value(item.id, F_NOTE, note)
         print(f"{version.key}: {note}")
         return result.outcome == ai.UNRELATED
     finally:
+        print(f"Cleaning up {repo_dir}: back to {version.branch}, local {branch} deleted")
         git_ops.discard_changes(repo_dir)
         git_ops.drop_backport_branch(repo_dir, version.branch, branch)
 
 
 def cmd_inspect(args, gh: Github, config: Config) -> None:
     """Inspect the failed CI of every open backport (and bump) PR in the project that has a clone dir."""
+    print(f"Reading project {config.project_owner}#{config.project_number}...", flush=True)
     project = open_project(gh, config)
     versions = project_versions(project, config)
     if args.version:
@@ -1000,6 +1013,9 @@ def cmd_inspect(args, gh: Github, config: Config) -> None:
     if not items:
         print("No open backport PRs.")
         return
+    print(f"{len(items)} open backport PR(s):")
+    for item in items:
+        print(f"  {item.version:<14} {item.backport_pr}  {item.title}")
     failed = False
     for n, item in enumerate(items, 1):
         print(f"\n##### [{n}/{len(items)}] {item.version} {item.backport_pr}")

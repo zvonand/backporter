@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 
 from github.Repository import Repository
@@ -80,15 +81,36 @@ def _details(pr_number: int, sha: str, run) -> str:
 def failures(repo: Repository, pr_number: int, sha: str) -> list[Failure] | None:
     """Failed checks of the commit, or None if CI hasn't finished (or started) on it."""
     runs = list(repo.get_commit(sha).get_check_runs())
-    if not runs or any(r.status != "completed" for r in runs):
+    pending = [r.name for r in runs if r.status != "completed"]
+    conclusions = Counter(r.conclusion for r in runs if r.status == "completed")
+    print(f"{len(runs)} check run(s): {len(pending)} not finished; "
+          + ", ".join(f"{n} {c}" for c, n in conclusions.most_common()))
+    if pending:
+        print(f"Not finished: {', '.join(pending[:10])}{', ...' if len(pending) > 10 else ''}")
+    if not runs or pending:
         return None
     failed = {r.name: r for r in runs if r.conclusion in FAILED_CONCLUSIONS}
-    return [Failure(name, run.html_url, _details(pr_number, sha, run)) for name, run in failed.items()]
+    result = []
+    for name, run in failed.items():
+        print(f"Reading the report of '{name}'...")
+        result.append(Failure(name, run.html_url, _details(pr_number, sha, run)))
+    return result
 
 
 def update_submodules(repo_dir: str) -> None:
     print("Updating submodules...")
     git_ops.run(["sh", "contrib/update-submodules.sh"], cwd=repo_dir, stream=True)
+
+
+def _tee(cmd: list[str], cwd: str, env: dict[str, str], log_path: str) -> int:
+    """Run cmd, printing its output and writing it to log_path; returns the exit code."""
+    print(f"$ {' '.join(cmd)}  (in {cwd}, log: {log_path})", flush=True)
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            print(line, end="")
+            log.write(line)
+        return proc.wait()
 
 
 def build(repo_dir: str, build_dir: str, cmake: str) -> str | None:
@@ -99,18 +121,17 @@ def build(repo_dir: str, build_dir: str, cmake: str) -> str | None:
     env = ai.locked_env()
     if not os.path.exists(os.path.join(build_dir, "build.ninja")):
         os.makedirs(build_dir, exist_ok=True)
-        print(f"Configuring {build_dir}: {cmake}")
-        result = subprocess.run(shlex.split(cmake), cwd=build_dir, env=env, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"cmake failed in {build_dir}:\n{excerpt(result.stdout + result.stderr)}")
+        print(f"Configuring {build_dir}...")
+        log_path = os.path.join(build_dir, "backporter-cmake.log")
+        if _tee(shlex.split(cmake), build_dir, env, log_path) != 0:
+            with open(log_path, errors="replace") as log:
+                raise RuntimeError(f"cmake failed in {build_dir}:\n{excerpt(log.read())}")
     log_path = os.path.join(build_dir, "backporter-build.log")
-    print(f"Building in {build_dir} (log: {log_path}); this can take a while...")
-    with open(log_path, "w") as log:
-        result = subprocess.run(["ninja"], cwd=build_dir, env=env, stdout=log, stderr=subprocess.STDOUT)
-    if result.returncode == 0:
+    print(f"Building in {build_dir}; this can take a while...")
+    if _tee(["ninja"], build_dir, env, log_path) == 0:
         print("Build OK")
         return None
     with open(log_path, errors="replace") as log:
         errors = excerpt(log.read())
-    print(f"Build failed:\n{errors[:3000]}")
+    print(f"Build failed; errors:\n{errors}")
     return errors

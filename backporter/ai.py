@@ -262,6 +262,13 @@ def complete(prompt: str) -> str:
     return _run_cli(tempfile.mkdtemp(prefix="backporter-ai-"), prompt, [])
 
 
+def print_tool_use(name: str, args: object) -> None:
+    """Print one tool call of the AI: its command, path or pattern."""
+    args = args if isinstance(args, dict) else {}
+    detail = args.get("command") or args.get("file_path") or args.get("path") or args.get("pattern") or ""
+    print(f"  AI [{name}] {str(detail)[:300]}")
+
+
 def _resolve_tools() -> list[str]:
     # File tools only inside the repo (paths relative to the working directory).
     allowed = ["Read(./**)", "Edit(./**)", "Write(./**)", "Glob(./**)", "Grep(./**)"]
@@ -306,6 +313,8 @@ def _run_cli(cwd: str, prompt: str, allowed: list[str]) -> str:
                 if block.get("type") == "text" and block.get("text", "").strip():
                     texts.append(block["text"])
                     print(f"  AI> {block['text'].strip()[:300]}")
+                elif block.get("type") == "tool_use":
+                    print_tool_use(block.get("name", ""), block.get("input"))
         elif event.get("type") == "result":
             final = event.get("result") or ""
     proc.wait()

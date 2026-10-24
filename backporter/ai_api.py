@@ -228,6 +228,7 @@ def run_agent(repo_dir: str, prompt: str, api_key: str, env: dict[str, str]) -> 
             return text
         results = []
         for block in tool_uses:
+            ai.print_tool_use(block.name, block.input)
             try:
                 _validate(block.name, block.input)
                 content, is_error = _execute(repo_dir, block.name, block.input, env), False
