@@ -1,5 +1,5 @@
 """
-AI resolution of cherry-pick conflicts.
+AI resolution of cherry-pick (backport) and merge (bump) conflicts.
 
 Backend: the Anthropic API when ANTHROPIC_API_KEY is set, otherwise the `claude` CLI (Claude plan limits).
 The AI works only in the clone dir and reports one outcome; the backporter does all git/GitHub work.
@@ -109,6 +109,40 @@ End your answer with these lines, exactly:
 OUTCOME: <RESOLVED|ALREADY_PRESENT|NOT_APPLICABLE|UNRESOLVED>
 NOTE: <one line: what you adapted, or why>
 BY: <PR URL that already brought the change; only for ALREADY_PRESENT, omit if unknown>
+SUMMARY:
+<2-5 short Markdown bullet points for reviewers: what conflicted in which file, why, and how you resolved it>
+"""
+
+
+def build_merge_prompt(repo_dir: str, branch: str, bump_branch: str, release_url: str, tag: str,
+                       conflicts: list[tuple[str, str]], conflict_sha: str) -> str:
+    files = "\n".join(f"- {path} ({kind})" for path, kind in conflicts)
+    return f"""You are resolving git merge conflicts in a ClickHouse version bump.
+
+Repository: {repo_dir} (your working directory)
+Target branch: {branch}, Altinity's release line with its own changes on top of upstream ClickHouse
+Current branch: {bump_branch}, created from {branch}
+Being merged: upstream release tag {tag} ({release_url}), a newer release of the same version
+
+The merge (`git merge --no-ff {tag}`) had conflicts in:
+{files}
+
+The merge was committed as-is, conflict markers included, as HEAD ({conflict_sha}). HEAD^1 is {branch}, HEAD^2 is {tag}.
+See upstream's changes with `git diff HEAD^1...HEAD^2 -- <path>` and Altinity's with `git diff HEAD^2...HEAD^1 -- <path>`.
+
+Your job: resolve every conflict so that the branch has upstream's changes from {tag} and keeps Altinity's changes from {branch}. Then decide on exactly one outcome:
+- RESOLVED: you resolved every conflict. Edit the files to remove all conflict markers and stage each one with `git add <path>` (or `git rm <path>`). The backporter commits your changes as a separate resolution commit.
+- UNRESOLVED: you cannot resolve it with confidence. Explain what blocks you.
+
+Rules:
+- Work only inside {repo_dir}. Change only files involved in this merge.
+- Do not commit, switch branches, reset, fetch or push. The backporter does that.
+- Use one plain command per Bash call, with no pipes, redirections or `&&`.
+- You have no network or GitHub access, so don't try to use them.
+
+End your answer with these lines, exactly:
+OUTCOME: <RESOLVED|UNRESOLVED>
+NOTE: <one line: what you resolved and how, or why you couldn't>
 SUMMARY:
 <2-5 short Markdown bullet points for reviewers: what conflicted in which file, why, and how you resolved it>
 """

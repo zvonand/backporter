@@ -1,5 +1,5 @@
 """
-Git and GitHub PR helpers for cherry-picking a merged PR into a local clone.
+Git and GitHub helpers for cherry-picking a merged PR, or merging an upstream release tag, into a local clone.
 """
 
 import os
@@ -85,6 +85,19 @@ def is_cherry_pick_in_progress(cwd: str) -> bool:
     return result.returncode == 0
 
 
+def is_merge_in_progress(cwd: str) -> bool:
+    result = run_no_check(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=cwd)
+    return result.returncode == 0
+
+
+def abort_in_progress(cwd: str) -> None:
+    """Abort a cherry-pick or merge in progress, if any."""
+    if is_cherry_pick_in_progress(cwd):
+        run(["git", "cherry-pick", "--abort"], cwd=cwd)
+    if is_merge_in_progress(cwd):
+        run(["git", "merge", "--abort"], cwd=cwd)
+
+
 def get_current_branch(cwd: str) -> str:
     """Return the current branch name."""
     result = subprocess.run(["git", "branch", "--show-current"], cwd=cwd, capture_output=True, text=True)
@@ -112,6 +125,23 @@ def parse_pr_url(url: str) -> tuple[str, int]:
         raise ValueError(f"Invalid PR URL: {url}")
     owner, repo, pr_num = match.groups()
     return f"{owner}/{repo}", int(pr_num)
+
+
+def parse_release_url(url: str) -> tuple[str, str]:
+    """Parse release URL (https://github.com/<owner>/<repo>/releases/tag/<tag>) into (owner/repo, tag)."""
+    match = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/releases/tag/([^/?#\s]+)", url)
+    if not match:
+        raise ValueError(f"Invalid release URL: {url}")
+    owner, repo, tag = match.groups()
+    return f"{owner}/{repo}", tag
+
+
+def release_number(tag: str) -> tuple[int, int, int]:
+    """'v26.8.34.13-lts' -> (26, 8, 34)"""
+    match = re.match(r"^v(\d+)\.(\d+)\.(\d+)\b", tag)
+    if not match:
+        raise ValueError(f"Release tag '{tag}' doesn't look like vX.Y.Z...")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 def get_merge_commit_sha(pr: PullRequest) -> str:
@@ -142,14 +172,16 @@ EMPTY = "empty"
 CONFLICTS = "conflicts"
 
 
-def cherry_pick(
-    repo_dir: str, target_repo: str, target_branch: str, backport_branch: str, pr_repo: str, merge_sha: str
-) -> tuple[str, list[tuple[str, str]]]:
-    """
-    Create backport_branch from the fresh target_branch in repo_dir and cherry-pick merge_sha.
-    Returns (PICKED | EMPTY | CONFLICTS, conflicted entries). EMPTY means the change is already in
-    target_branch. On CONFLICTS the cherry-pick is left in progress for resolving.
-    """
+def pick_command(merge_sha: str) -> list[str]:
+    return ["git", "cherry-pick", "-m", "1", merge_sha, "--no-edit"]
+
+
+def merge_command(tag: str) -> list[str]:
+    return ["git", "merge", "--no-ff", "--no-edit", tag]
+
+
+def _start_branch(repo_dir: str, target_repo: str, target_branch: str, backport_branch: str) -> None:
+    """Create backport_branch from the fresh target_branch in repo_dir (asking before discarding local state)."""
     check_repo_dir(repo_dir)
     check_origin(repo_dir, target_repo)
     print(f"Fetching latest {target_branch} from {target_repo}...")
@@ -159,7 +191,7 @@ def cherry_pick(
         print(co_result.stderr, file=sys.stderr)
         if not prompt_yes_no("Unresolved conflicts or dirty state. Recreate backport branch from clean target?"):
             raise RuntimeError("Aborted; repo left as is")
-        run_no_check(["git", "cherry-pick", "--abort"], cwd=repo_dir)
+        abort_in_progress(repo_dir)
         run(["git", "checkout", target_branch], cwd=repo_dir)
         run(["git", "pull", "origin", target_branch], cwd=repo_dir, stream=True)
         run_no_check(["git", "branch", "-D", backport_branch], cwd=repo_dir)
@@ -177,29 +209,70 @@ def cherry_pick(
     print(f"Creating branch {backport_branch}...")
     run(["git", "checkout", "-b", backport_branch], cwd=repo_dir)
 
-    # The repo where the PR was merged is upstream of the target fork
-    if target_repo == pr_repo:
-        run(["git", "fetch", "origin", merge_sha], cwd=repo_dir, stream=True)
-    else:
-        pr_fetch_url = f"https://github.com/{pr_repo}.git"
-        result = run_no_check(["git", "remote", "add", "upstream", pr_fetch_url], cwd=repo_dir)
-        if result.returncode != 0 and "already exists" in result.stderr:
-            run(["git", "remote", "set-url", "upstream", pr_fetch_url], cwd=repo_dir)
-        print(f"Fetching from upstream ({pr_repo})...")
-        run(["git", "fetch", "upstream", merge_sha], cwd=repo_dir, stream=True)
+
+def _fetch_source(repo_dir: str, target_repo: str, source_repo: str, *fetch_args: str) -> None:
+    """`git fetch <remote> *fetch_args` from origin if source_repo is target_repo, else from `upstream` (added/updated)."""
+    if target_repo == source_repo:
+        run(["git", "fetch", "origin", *fetch_args], cwd=repo_dir, stream=True)
+        return
+    fetch_url = f"https://github.com/{source_repo}.git"
+    result = run_no_check(["git", "remote", "add", "upstream", fetch_url], cwd=repo_dir)
+    if result.returncode != 0 and "already exists" in result.stderr:
+        run(["git", "remote", "set-url", "upstream", fetch_url], cwd=repo_dir)
+    print(f"Fetching from upstream ({source_repo})...")
+    run(["git", "fetch", "upstream", *fetch_args], cwd=repo_dir, stream=True)
+
+
+def _conflicts_or_fail(repo_dir: str, result: subprocess.CompletedProcess, cmd: list[str]) -> list[tuple[str, str]]:
+    """Conflicted entries after a failed cmd; raises if the failure wasn't conflicts."""
+    print(result.stderr or result.stdout, file=sys.stderr)
+    conflicted = get_conflicted_entries(repo_dir)
+    if not conflicted:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return conflicted
+
+
+def cherry_pick(
+    repo_dir: str, target_repo: str, target_branch: str, backport_branch: str, pr_repo: str, merge_sha: str
+) -> tuple[str, list[tuple[str, str]]]:
+    """
+    Create backport_branch from the fresh target_branch in repo_dir and cherry-pick merge_sha.
+    Returns (PICKED | EMPTY | CONFLICTS, conflicted entries). EMPTY means the change is already in
+    target_branch. On CONFLICTS the cherry-pick is left in progress for resolving.
+    """
+    _start_branch(repo_dir, target_repo, target_branch, backport_branch)
+    _fetch_source(repo_dir, target_repo, pr_repo, merge_sha)
 
     print("Cherry-picking merge commit...")
-    cp_result = run_no_check(["git", "cherry-pick", "-m", "1", merge_sha, "--no-edit"], cwd=repo_dir)
+    cmd = pick_command(merge_sha)
+    cp_result = run_no_check(cmd, cwd=repo_dir)
     if cp_result.returncode == 0:
         return PICKED, []
-    conflicted = get_conflicted_entries(repo_dir)
-    if conflicted:
-        print(cp_result.stderr, file=sys.stderr)
-        return CONFLICTS, conflicted
-    if is_cherry_pick_in_progress(repo_dir) and index_matches_head(repo_dir):
+    if not get_conflicted_entries(repo_dir) and is_cherry_pick_in_progress(repo_dir) and index_matches_head(repo_dir):
         return EMPTY, []
-    print(cp_result.stderr, file=sys.stderr)
-    raise RuntimeError(f"Command failed: git cherry-pick -m 1 {merge_sha} --no-edit")
+    return CONFLICTS, _conflicts_or_fail(repo_dir, cp_result, cmd)
+
+
+def merge_tag(
+    repo_dir: str, target_repo: str, target_branch: str, bump_branch: str, source_repo: str, tag: str
+) -> tuple[str, list[tuple[str, str]]]:
+    """
+    Create bump_branch from the fresh target_branch in repo_dir and merge source_repo's tag into it (--no-ff).
+    Returns (PICKED | EMPTY | CONFLICTS, conflicted entries). EMPTY means the tag is already in target_branch.
+    On CONFLICTS the merge is left in progress for resolving.
+    """
+    _start_branch(repo_dir, target_repo, target_branch, bump_branch)
+    # Only this tag: tags of upstream's whole history would otherwise come along.
+    _fetch_source(repo_dir, target_repo, source_repo, "--no-tags", f"+refs/tags/{tag}:refs/tags/{tag}")
+    if is_ancestor(repo_dir, f"refs/tags/{tag}", "HEAD"):
+        return EMPTY, []
+
+    print(f"Merging {tag}...")
+    cmd = merge_command(tag)
+    result = run_no_check(cmd, cwd=repo_dir)
+    if result.returncode == 0:
+        return PICKED, []
+    return CONFLICTS, _conflicts_or_fail(repo_dir, result, cmd)
 
 
 def index_matches_head(repo_dir: str) -> bool:
@@ -210,9 +283,8 @@ def index_matches_head(repo_dir: str) -> bool:
 
 
 def drop_backport_branch(repo_dir: str, target_branch: str, backport_branch: str) -> None:
-    """Abort any cherry-pick, go back to target_branch and delete the local backport branch."""
-    if is_cherry_pick_in_progress(repo_dir):
-        run(["git", "cherry-pick", "--abort"], cwd=repo_dir)
+    """Abort any cherry-pick or merge, go back to target_branch and delete the local backport branch."""
+    abort_in_progress(repo_dir)
     run(["git", "checkout", target_branch], cwd=repo_dir)
     if branch_exists(repo_dir, backport_branch):
         run(["git", "branch", "-D", backport_branch], cwd=repo_dir)
@@ -240,29 +312,32 @@ def commits_mentioning(repo_dir: str, ref: str, number: int, title: str, merge_s
     return shas
 
 
-def continue_cherry_pick(repo_dir: str, backport_branch: str) -> str:
+def continue_in_progress(repo_dir: str, backport_branch: str) -> str:
     """
-    Stage everything and finish an in-progress cherry-pick on backport_branch.
-    Returns PICKED, or EMPTY if the resolution leaves no changes (the cherry-pick stays in progress).
+    Stage everything and finish an in-progress cherry-pick or merge on backport_branch.
+    Returns PICKED, or EMPTY if a cherry-pick's resolution leaves no changes (it then stays in progress).
+    A merge is always committed: it records the merged tag even when it changes no files.
     """
     check_repo_dir(repo_dir)
     if get_current_branch(repo_dir) != backport_branch:
         raise RuntimeError(f"{repo_dir} is not on {backport_branch}")
-    if not is_cherry_pick_in_progress(repo_dir):
-        raise RuntimeError("No cherry-pick in progress (CHERRY_PICK_HEAD not found)")
+    merge = is_merge_in_progress(repo_dir)
+    if not merge and not is_cherry_pick_in_progress(repo_dir):
+        raise RuntimeError("No cherry-pick or merge in progress (CHERRY_PICK_HEAD/MERGE_HEAD not found)")
     print("Staging all changes...")
     run(["git", "add", "."], cwd=repo_dir)
-    if index_matches_head(repo_dir):
+    if not merge and index_matches_head(repo_dir):
         return EMPTY
-    print("Continuing cherry-pick...")
+    operation = "merge" if merge else "cherry-pick"
+    print(f"Continuing {operation}...")
     env = os.environ.copy()
     env["GIT_EDITOR"] = "true"
     result = subprocess.run(
-        ["git", "cherry-pick", "--continue"], cwd=repo_dir, env=env, capture_output=True, text=True
+        ["git", operation, "--continue"], cwd=repo_dir, env=env, capture_output=True, text=True
     )
     if result.returncode != 0:
         print(result.stderr or result.stdout, file=sys.stderr)
-        raise RuntimeError("git cherry-pick --continue failed")
+        raise RuntimeError(f"git {operation} --continue failed")
     return PICKED
 
 
@@ -283,15 +358,15 @@ def _commit(repo_dir: str, message: str, *extra: str) -> str:
 
 
 def commit_conflicts(repo_dir: str, conflicts: list[tuple[str, str]]) -> str:
-    """Finish the in-progress cherry-pick by committing the conflicted files as they are (with markers)."""
+    """Finish the in-progress cherry-pick or merge by committing the conflicted files as they are (with markers)."""
     msg_path = os.path.join(repo_dir, run(["git", "rev-parse", "--git-path", "MERGE_MSG"], cwd=repo_dir).stdout.strip())
     message = open(msg_path).read() if os.path.exists(msg_path) else "Cherry-pick\n"
     listing = "\n".join(f"- {path} ({kind})" for path, kind in conflicts)
     message = f"{message.rstrip()}\n\nConflicts committed as-is; the next commit resolves them:\n{listing}\n"
     run(["git", "add", "-A", "--", *[path for path, _ in conflicts]], cwd=repo_dir)
     sha = _commit(repo_dir, message)
-    if is_cherry_pick_in_progress(repo_dir):
-        raise RuntimeError("cherry-pick still in progress after committing the conflicts")
+    if is_cherry_pick_in_progress(repo_dir) or is_merge_in_progress(repo_dir):
+        raise RuntimeError("cherry-pick or merge still in progress after committing the conflicts")
     return sha
 
 
@@ -306,10 +381,10 @@ def same_tree(repo_dir: str, ref: str) -> bool:
     return run_no_check(["git", "diff", "--quiet", ref, "HEAD"], cwd=repo_dir).returncode == 0
 
 
-def redo_pick(repo_dir: str, merge_sha: str) -> list[tuple[str, str]]:
-    """Drop the conflict commit and cherry-pick again, leaving the conflicts in progress for a human."""
+def redo(repo_dir: str, command: list[str]) -> list[tuple[str, str]]:
+    """Drop the conflict commit and run command (the cherry-pick or merge) again, leaving the conflicts in progress."""
     run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo_dir)
-    run_no_check(["git", "cherry-pick", "-m", "1", merge_sha, "--no-edit"], cwd=repo_dir)
+    run_no_check(command, cwd=repo_dir)
     return get_conflicted_entries(repo_dir)
 
 

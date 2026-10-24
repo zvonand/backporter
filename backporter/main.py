@@ -11,6 +11,10 @@ Backport tracker backed by a GitHub Project.
     backporter continue <PR-URL> <version>    finish after resolving conflicts (--ai: let AI resolve them)
     backporter mark <PR-URL> <version> present|not-applicable [--by URL] [--note TEXT]
     backporter describe <PR-URL>              print a PR's changelog category and entry (as in backport PRs)
+
+Instead of a <PR-URL>, add/remove/start/continue/mark also take an upstream release URL, e.g.
+https://github.com/ClickHouse/ClickHouse/releases/tag/v26.8.34.13-lts, for a bump: its tag is merged into
+the version, and a bump of one flavor of X.Y implies every flavor of X.Y and nothing else.
 """
 
 import argparse
@@ -18,6 +22,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
 
 from github import Github, GithubException
@@ -44,8 +49,83 @@ def source_url(pr_repo: str, number: int) -> str:
     return f"https://github.com/{pr_repo}/pull/{number}"
 
 
-def backport_branch(version: Version, number: int) -> str:
-    return f"backports/{version.branch}/{number}"
+def release_url(repo: str, tag: str) -> str:
+    return f"https://github.com/{repo}/releases/tag/{tag}"
+
+
+def parse_source(text: str) -> str:
+    """The canonical URL of the source PR, or else of the release (for a bump), named in text."""
+    try:
+        return source_url(*git_ops.parse_pr_url(text))
+    except ValueError:
+        pass
+    try:
+        return release_url(*git_ops.parse_release_url(text))
+    except ValueError:
+        raise ValueError(f"No PR or release URL in '{text}'")
+
+
+def is_bump(url: str) -> bool:
+    """Whether a source URL is a release (a bump) rather than a PR."""
+    return "/releases/tag/" in url
+
+
+def bump_number(tag: str) -> str:
+    """'v26.8.34.13-lts' -> '26.8.34'"""
+    return ".".join(map(str, git_ops.release_number(tag)))
+
+
+@dataclass
+class Source:
+    """What goes into a version: a merged PR (cherry-picked) or an upstream release (its tag merged: a bump)."""
+    url: str
+    repo: str
+    pr: PullRequest | None = None
+    tag: str = ""
+
+    @property
+    def title(self) -> str:
+        """Title of the source's draft rows."""
+        return f"Bump to {self.tag}" if self.tag else f"{self.repo}#{self.pr.number} {self.pr.title}"
+
+    @property
+    def operation(self) -> str:
+        return "merge" if self.tag else "cherry-pick"
+
+    @property
+    def subject(self) -> str:
+        return f"merge of {self.tag}" if self.tag else f"backport of #{self.pr.number}"
+
+    @property
+    def command(self) -> list[str]:
+        """The git command that brings the source into a branch."""
+        return git_ops.merge_command(self.tag) if self.tag else git_ops.pick_command(self.pr.merge_commit_sha)
+
+    def pr_title(self, version: Version) -> str:
+        """Title of the backport (or bump) PR into version."""
+        if self.tag:
+            return f"{version.label}: Bump to {bump_number(self.tag)}"
+        return f"{version.label} Backport of #{self.pr.number} - {self.pr.title}"
+
+
+def load_source(gh: Github, text: str) -> Source:
+    """The source PR or release named in text; raises if it doesn't exist."""
+    url = parse_source(text)
+    if is_bump(url):
+        repo, tag = git_ops.parse_release_url(url)
+        git_ops.release_number(tag)
+        # Raises GithubException if there's no such release.
+        gh.get_repo(repo).get_release(tag)
+        return Source(url, repo, tag=tag)
+    repo, number = git_ops.parse_pr_url(url)
+    return Source(url, repo, pr=gh.get_repo(repo).get_pull(number))
+
+
+def backport_branch(version: Version, url: str) -> str:
+    """backports/<branch>/<PR number>, or bump/<branch>/<X.Y.Z> for a release."""
+    if is_bump(url):
+        return f"bump/{version.branch}/{bump_number(git_ops.parse_release_url(url)[1])}"
+    return f"backports/{version.branch}/{git_ops.parse_pr_url(url)[1]}"
 
 
 def open_project(gh: Github, config: Config) -> Project:
@@ -80,7 +160,7 @@ def create_item(
     project: Project, version: Version, url: str, title: str, requested: str, requested_by: str,
     status: str = NOT_STARTED, note: str = "", not_needed_from: str = "",
 ) -> Item:
-    """Add an item (Not started unless given); title is '<owner/repo>#<N> <source PR title>'."""
+    """Add an item (Not started unless given); title is the source's (see Source.title)."""
     values = {
         F_SOURCE_PR: url,
         F_VERSION: version.key,
@@ -167,6 +247,29 @@ def not_needed_note(bound: str, requested_by: str) -> str:
     return f"Not needed from {bound} (per request by @{requested_by})"
 
 
+def bump_problem(url: str, keys: list[str], not_needed_from: str) -> str | None:
+    """Why the release at url can't be requested as a bump of keys, or None if it can."""
+    if not_needed_from:
+        return "'Not needed from' doesn't apply to a bump"
+    tag = git_ops.parse_release_url(url)[1]
+    try:
+        number = git_ops.release_number(tag)[:2]
+    except ValueError as e:
+        return str(e)
+    wrong = [k for k in keys if version_number(k.split("-", 1)[1]) != number]
+    return f"{tag} is not a release of {', '.join(wrong)}" if wrong else None
+
+
+def read_template(repo: Repository) -> str:
+    """The PR template of repo's current default branch; raises pr_body.TemplateError if it can't be read."""
+    try:
+        return repo.get_contents(pr_body.TEMPLATE_PATH, ref=repo.default_branch).decoded_content.decode()
+    except GithubException as e:
+        raise pr_body.TemplateError(
+            f"can't read {pr_body.TEMPLATE_PATH} from {repo.full_name}@{repo.default_branch}: {e.status}"
+        )
+
+
 def backport_body(repo: Repository, pr: PullRequest) -> str:
     """
     The PR template of repo's current default branch with the source PR's changelog category and entry
@@ -175,12 +278,7 @@ def backport_body(repo: Repository, pr: PullRequest) -> str:
     """
     if not pr.user:
         raise pr_body.Unclear("the source PR has no author")
-    try:
-        template = repo.get_contents(pr_body.TEMPLATE_PATH, ref=repo.default_branch).decoded_content.decode()
-    except GithubException as e:
-        raise pr_body.TemplateError(
-            f"can't read {pr_body.TEMPLATE_PATH} from {repo.full_name}@{repo.default_branch}: {e.status}"
-        )
+    template = read_template(repo)
     try:
         return pr_body.build(template, pr.body or "", pr.html_url, pr.user.login)
     except pr_body.Unclear as e:
@@ -231,11 +329,12 @@ def cmd_add_version(args, gh: Github, config: Config) -> None:
     for item in tracked_items(project):
         by_pr[item.source_pr].append(item)
     for url, items in by_pr.items():
+        bump = is_bump(url)
         present = {i.version for i in items}
         needed = {
             v.key
             for i in items if i.requested == EXPLICIT and i.version in keys
-            for v in closure(find_version(versions, i.version), versions)
+            for v in closure(find_version(versions, i.version), versions, bump)
         }
         explicit = [i for i in items if i.requested == EXPLICIT and i.version in keys]
         title = None
@@ -243,9 +342,10 @@ def cmd_add_version(args, gh: Github, config: Config) -> None:
             if version.key not in needed or version.key in present:
                 continue
             if title is None:
-                pr_repo, number = git_ops.parse_pr_url(url)
-                title = f"{pr_repo}#{number} {gh.get_repo(pr_repo).get_pull(number).title}"
-            implied_by = [i for i in explicit if version in closure(find_version(versions, i.version), versions)]
+                title = load_source(gh, url).title
+            implied_by = [
+                i for i in explicit if version in closure(find_version(versions, i.version), versions, bump)
+            ]
             active = [
                 i for i in implied_by
                 if not i.not_needed_from or version.version < version_number(i.not_needed_from)
@@ -266,23 +366,25 @@ def track(
     created: list[Item] | None = None, not_needed_from: str = "",
 ) -> None:
     """
-    Track a backport of pr_url to version_key (explicit) and every version it implies, for `requested_by`.
+    Track a backport of pr_url (or a bump to the release at pr_url) to version_key (explicit) and every version
+    it implies, for `requested_by`.
     Implied versions >= not_needed_from (a version number like '26.3') get new rows marked Not applicable;
     existing rows are left as they are, since other requests may need them.
     New items are appended to `created`; items already in it count as existing, since GitHub's
     item list can lag behind for a while after items are added.
     """
     created = [] if created is None else created
-    pr_repo, number = git_ops.parse_pr_url(pr_url)
-    url = source_url(pr_repo, number)
+    source = load_source(gh, pr_url)
+    url = source.url
     versions = project_versions(project, config)
     target = find_version(versions, version_key)
+    if source.tag and (problem := bump_problem(url, [target.key], not_needed_from)):
+        raise ValueError(problem)
     bound = version_number(not_needed_from) if not_needed_from else None
     if bound and target.version >= bound:
         raise ValueError(f"{target.key} is not below 'Not needed from' {not_needed_from}")
-    pr = gh.get_repo(pr_repo).get_pull(number)
     existing = {**pr_items(project, url), **{i.version: i for i in created if i.source_pr == url}}
-    for v in closure(target, versions):
+    for v in closure(target, versions, bool(source.tag)):
         requested = EXPLICIT if v == target else IMPLIED
         item = existing.get(v.key)
         if item and v == target and not_needed_from and item.not_needed_from != not_needed_from:
@@ -307,7 +409,7 @@ def track(
             elif requested == EXPLICIT:
                 print(f"{v.key}: already requested ({item.status})")
             continue
-        title = f"{pr_repo}#{number} {pr.title}"
+        title = source.title
         if bound and v.version >= bound:
             created.append(create_item(
                 project, v, url, title, requested, requested_by, NOT_APPLICABLE,
@@ -328,7 +430,8 @@ def cmd_add(args, gh: Github, config: Config) -> None:
 def process_requests(gh: Github, project: Project, config: Config) -> list[Item]:
     """
     Turn items added by hand in the web UI into tracked items, then delete them.
-    The PR URL comes from the Source PR field, the item's own PR, the title or the body; versions come from
+    The PR URL (or release URL, for a bump) comes from the Source PR field, the item's own PR, the title or the
+    body; versions come from
     the Version field and from version keys in the title, body or Note. Whoever added the request row
     becomes "Requested by".
     """
@@ -339,9 +442,9 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
             continue
         text = " ".join((item.source_pr, item.content_url, item.title, item.body))
         try:
-            pr_repo, number = git_ops.parse_pr_url(text)
+            url = parse_source(text)
         except ValueError:
-            print(f"Request '{item.title}': no PR URL found; skipped", file=sys.stderr)
+            print(f"Request '{item.title}': no PR or release URL found; skipped", file=sys.stderr)
             continue
         requested = ([item.version] if item.version else []) + _VERSION_KEY_RE.findall(
             f"{item.title} {item.body} {item.note}"
@@ -354,6 +457,9 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
             )
             continue
         bound = item.not_needed_from
+        if is_bump(url) and (problem := bump_problem(url, requested, bound)):
+            print(f"Request '{item.title}': {problem}; skipped", file=sys.stderr)
+            continue
         too_high = [k for k in requested if bound and version_number(k.split("-", 1)[1]) >= version_number(bound)]
         if too_high:
             print(
@@ -361,7 +467,6 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
                 file=sys.stderr,
             )
             continue
-        url = source_url(pr_repo, number)
         limit = f" (not needed from {bound})" if bound else ""
         print(f"Request '{item.title}': {url} -> {', '.join(dict.fromkeys(requested))}{limit}")
         for key in dict.fromkeys(requested):
@@ -371,8 +476,7 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
 
 
 def cmd_remove(args, gh: Github, config: Config) -> None:
-    pr_repo, number = git_ops.parse_pr_url(args.pr)
-    url = source_url(pr_repo, number)
+    url = parse_source(args.pr)
     project = open_project(gh, config)
     versions = project_versions(project, config)
     target = find_version(versions, args.version)
@@ -380,7 +484,7 @@ def cmd_remove(args, gh: Github, config: Config) -> None:
     other_explicit = [
         find_version(versions, k) for k, i in items.items() if i.requested == EXPLICIT and k != target.key
     ]
-    for v in plan_remove(target, other_explicit, versions):
+    for v in plan_remove(target, other_explicit, versions, is_bump(url)):
         item = items.get(v.key)
         if item:
             project.delete_item(item.id)
@@ -391,9 +495,8 @@ def find_backport_pr(repo: Repository, item: Item, version: Version) -> PullRequ
     if item.backport_pr:
         _, number = git_ops.parse_pr_url(item.backport_pr)
         return repo.get_pull(number)
-    _, number = git_ops.parse_pr_url(item.source_pr)
     owner = repo.full_name.split("/")[0]
-    pulls = list(repo.get_pulls(state="all", head=f"{owner}:{backport_branch(version, number)}"))
+    pulls = list(repo.get_pulls(state="all", head=f"{owner}:{backport_branch(version, item.source_pr)}"))
     return pulls[0] if pulls else None
 
 
@@ -461,26 +564,26 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
         for i in its:
             if i.requested != EXPLICIT or i.version not in versions:
                 continue
-            missing = [v.key for v in closure(versions[i.version], version_list) if v.key not in present]
+            missing = [v.key for v in closure(versions[i.version], version_list, is_bump(url)) if v.key not in present]
             if missing:
                 print(f"\n{url}: missing {', '.join(missing)}; run `backporter add {url} {i.version}`")
 
 
 def finish_backport(
-    gh: Github, project: Project, config: Config, item: Item, version: Version, pr: PullRequest, repo_dir: str,
+    gh: Github, project: Project, config: Config, item: Item, version: Version, source: Source, repo_dir: str,
     comment: str = "",
 ) -> bool:
     """
-    Push the backport branch, open (or reuse) the backport PR, update the project item.
+    Push the backport (or bump) branch, open (or reuse) its PR, update the project item.
     False, with nothing pushed, if the PR body needs a human.
     """
-    branch = backport_branch(version, pr.number)
+    branch = backport_branch(version, source.url)
     repo = gh.get_repo(TARGET_REPO)
     # get_repo follows renames/redirects; never open a PR anywhere but TARGET_REPO.
     if repo.full_name.lower() != TARGET_REPO.lower():
         raise RuntimeError(f"Refusing to open a PR in {repo.full_name}; only {TARGET_REPO} is allowed")
     try:
-        body = backport_body(repo, pr)
+        body = pr_body.not_for_changelog(read_template(repo)) if source.tag else backport_body(repo, source.pr)
     except (pr_body.Unclear, pr_body.TemplateError) as e:
         project.set_value(item.id, F_NOTE, f"PR body needs a human: {e}")
         project.set_value(item.id, F_STATUS, CONFLICTS)
@@ -497,7 +600,7 @@ def finish_backport(
         backport = repo.create_pull(
             base=version.branch,
             head=branch,
-            title=f"{version.label} Backport of #{pr.number} - {pr.title}",
+            title=source.pr_title(version),
             body=body,
         )
     labels = config.labels_for(version)
@@ -543,63 +646,76 @@ def find_existing(gh: Github, repo_dir: str, version: Version, pr: PullRequest, 
 
 
 def record_present(
-    gh: Github, project: Project, item: Item, version: Version, pr: PullRequest, pr_repo: str, repo_dir: str,
+    gh: Github, project: Project, item: Item, version: Version, source: Source, repo_dir: str,
     note: str | None = None, by: str | None = None,
 ) -> None:
     """Drop the local backport branch and mark the item Already present, naming the PR that brought it."""
-    git_ops.drop_backport_branch(repo_dir, version.branch, backport_branch(version, pr.number))
-    by = by or find_existing(gh, repo_dir, version, pr, pr_repo)
+    git_ops.drop_backport_branch(repo_dir, version.branch, backport_branch(version, source.url))
+    if source.tag:
+        set_outcome(project, item, PRESENT, note or f"{source.tag} is already in {version.branch}", by)
+        return
+    by = by or find_existing(gh, repo_dir, version, source.pr, source.repo)
     found = f"via {by}" if by else "introducing PR not found"
     set_outcome(project, item, PRESENT, f"{note}; {found}" if note else f"Already in {version.branch}; {found}", by)
 
 
 def resolve_with_ai(
-    gh: Github, project: Project, config: Config, item: Item, version: Version, pr: PullRequest, pr_repo: str,
-    repo_dir: str, conflicts: list[tuple[str, str]],
+    gh: Github, project: Project, config: Config, item: Item, version: Version, source: Source, repo_dir: str,
+    conflicts: list[tuple[str, str]],
 ) -> bool:
     """
-    Commit the cherry-pick with its conflicts as-is, let the AI resolve them, commit the resolution separately,
-    and act on the AI's outcome. False if it stayed unresolved (the conflicts are then left in progress again).
+    Commit the cherry-pick (or merge) with its conflicts as-is, let the AI resolve them, commit the resolution
+    separately, and act on the AI's outcome. False if it stayed unresolved (the conflicts are then left in progress
+    again). A bump can only be resolved or unresolved.
     """
-    branch = backport_branch(version, pr.number)
+    branch = backport_branch(version, source.url)
     conflict_sha = git_ops.commit_conflicts(repo_dir, conflicts)
-    print(f"Committed the cherry-pick with its conflicts as-is: {conflict_sha[:12]}")
-    prompt = ai.build_prompt(
-        repo_dir, version.branch, branch, pr.html_url, pr.title, pr.body or "", pr.merge_commit_sha, conflicts,
-        conflict_sha,
-    )
+    print(f"Committed the {source.operation} with its conflicts as-is: {conflict_sha[:12]}")
+    if source.tag:
+        prompt = ai.build_merge_prompt(
+            repo_dir, version.branch, branch, source.url, source.tag, conflicts, conflict_sha,
+        )
+    else:
+        pr = source.pr
+        prompt = ai.build_prompt(
+            repo_dir, version.branch, branch, pr.html_url, pr.title, pr.body or "", pr.merge_commit_sha, conflicts,
+            conflict_sha,
+        )
     result = ai.resolve(repo_dir, prompt, conflicts)
     if result.outcome == ai.RESOLVED:
         resolution_sha = git_ops.commit_resolution(
-            repo_dir, f"Resolve conflicts in backport of #{pr.number}\n\n{result.note}\n"
+            repo_dir, f"Resolve conflicts in {source.subject}\n\n{result.note}\n"
         )
         print(f"Committed the resolution: {resolution_sha[:12]}")
-        if git_ops.same_tree(repo_dir, version.branch):
-            record_present(gh, project, item, version, pr, pr_repo, repo_dir, f"AI: {result.note}")
+        # A bump's merge commit is kept even if it changes nothing: it records the merged tag.
+        if not source.tag and git_ops.same_tree(repo_dir, version.branch):
+            record_present(gh, project, item, version, source, repo_dir, f"AI: {result.note}")
             return True
         project.set_value(item.id, F_NOTE, f"AI resolved conflicts: {result.note}")
-        comment = conflict_comment(conflicts, conflict_sha, resolution_sha, result)
-        return finish_backport(gh, project, config, item, version, pr, repo_dir, comment)
-    if result.outcome == ai.ALREADY_PRESENT:
-        record_present(gh, project, item, version, pr, pr_repo, repo_dir, f"AI: {result.note}", result.by or None)
+        comment = conflict_comment(conflicts, conflict_sha, resolution_sha, result, source.operation)
+        return finish_backport(gh, project, config, item, version, source, repo_dir, comment)
+    if not source.tag and result.outcome == ai.ALREADY_PRESENT:
+        record_present(gh, project, item, version, source, repo_dir, f"AI: {result.note}", result.by or None)
         return True
-    if result.outcome == ai.NOT_APPLICABLE:
+    if not source.tag and result.outcome == ai.NOT_APPLICABLE:
         git_ops.drop_backport_branch(repo_dir, version.branch, branch)
         set_outcome(project, item, NOT_APPLICABLE, f"AI: {result.note}")
         return True
-    git_ops.redo_pick(repo_dir, pr.merge_commit_sha)
+    git_ops.redo(repo_dir, source.command)
     project.set_value(item.id, F_NOTE, f"AI could not resolve: {result.note}")
     project.set_value(item.id, F_STATUS, CONFLICTS)
     return False
 
 
-def conflict_comment(conflicts: list[tuple[str, str]], conflict_sha: str, resolution_sha: str, result: ai.Result) -> str:
-    """Comment for the backport PR: what conflicted and how the AI resolved it."""
+def conflict_comment(
+    conflicts: list[tuple[str, str]], conflict_sha: str, resolution_sha: str, result: ai.Result, operation: str,
+) -> str:
+    """Comment for the backport (or bump) PR: what conflicted and how the AI resolved it."""
     files = "\n".join(f"- `{path}` ({kind})" for path, kind in conflicts)
     return (
-        "**Backporter: cherry-pick conflicts resolved by AI**\n\n"
+        f"**Backporter: {operation} conflicts resolved by AI**\n\n"
         f"Conflicted files:\n{files}\n\n"
-        f"Commits:\n- {conflict_sha[:12]}: cherry-pick with the conflicts committed as-is\n"
+        f"Commits:\n- {conflict_sha[:12]}: {operation} with the conflicts committed as-is\n"
         f"- {resolution_sha[:12]}: resolution\n\n"
         f"{result.summary or result.note}\n"
     )
@@ -620,15 +736,17 @@ def check_labels(gh: Github, config: Config, versions: list[Version]) -> None:
 
 
 def backport(
-    gh: Github, project: Project, config: Config, pr: PullRequest, pr_repo: str, items: dict[str, Item],
+    gh: Github, project: Project, config: Config, source: Source, items: dict[str, Item],
     targets: list[Version], dirs: dict[str, str], use_ai: bool, keep_clone_clean: bool = False,
 ) -> bool:
     """
-    Backport pr into targets (each has a clone dir), oldest first. False if a version ended in unresolved conflicts.
+    Backport source into targets (each has a clone dir), oldest first: cherry-pick a PR, or merge a release's tag
+    for a bump. False if a version ended in unresolved conflicts.
     By default it stops there, leaving the conflicts in progress for `continue`. With keep_clone_clean (for `run`,
     where clones are shared) it drops that attempt, notes how to redo it by hand, and goes on with the next version.
     """
-    merge_sha = git_ops.get_merge_commit_sha(pr)
+    ref = source.tag or git_ops.get_merge_commit_sha(source.pr)
+    apply = git_ops.merge_tag if source.tag else git_ops.cherry_pick
     for v in targets:
         git_ops.check_repo_dir(dirs[v.key])
         git_ops.check_origin(dirs[v.key], TARGET_REPO)
@@ -638,39 +756,36 @@ def backport(
     for v in sort_versions(targets):
         item = items[v.key]
         print(f"\n=== {v.key} ===")
-        outcome, conflicts = git_ops.cherry_pick(
-            dirs[v.key], TARGET_REPO, v.branch, backport_branch(v, pr.number), pr_repo, merge_sha
-        )
+        outcome, conflicts = apply(dirs[v.key], TARGET_REPO, v.branch, backport_branch(v, source.url), source.repo, ref)
         if outcome == git_ops.EMPTY:
-            record_present(gh, project, item, v, pr, pr_repo, dirs[v.key])
+            record_present(gh, project, item, v, source, dirs[v.key])
             continue
         if outcome == git_ops.CONFLICTS:
-            if use_ai and resolve_with_ai(gh, project, config, item, v, pr, pr_repo, dirs[v.key], conflicts):
+            if use_ai and resolve_with_ai(gh, project, config, item, v, source, dirs[v.key], conflicts):
                 continue
             project.set_value(item.id, F_STATUS, CONFLICTS)
             print(f"\nConflicts in {len(conflicts)} file(s) in {dirs[v.key]}:", file=sys.stderr)
             for path, kind in conflicts:
                 print(f"  {path}  ({kind})", file=sys.stderr)
             if not keep_clone_clean:
-                print(f"\nResolve them, then run: backporter continue {pr.html_url} {v.key}", file=sys.stderr)
+                print(f"\nResolve them, then run: backporter continue {source.url} {v.key}", file=sys.stderr)
                 return False
-            git_ops.drop_backport_branch(dirs[v.key], v.branch, backport_branch(v, pr.number))
+            git_ops.drop_backport_branch(dirs[v.key], v.branch, backport_branch(v, source.url))
             files = ", ".join(path for path, _ in conflicts)
-            redo = f"backporter start {pr.html_url} {v.key}, resolve, then backporter continue {pr.html_url} {v.key}"
+            redo = f"backporter start {source.url} {v.key}, resolve, then backporter continue {source.url} {v.key}"
             if not use_ai:
                 project.set_value(item.id, F_NOTE, f"Conflicts in {files}; to do it by hand: {redo}")
             print(f"Dropped this attempt to keep {dirs[v.key]} clean; to do it by hand: {redo}", file=sys.stderr)
             ok = False
             continue
-        if not finish_backport(gh, project, config, item, v, pr, dirs[v.key]):
+        if not finish_backport(gh, project, config, item, v, source, dirs[v.key]):
             ok = False
     return ok
 
 
 def cmd_start(args, gh: Github, config: Config) -> None:
-    pr_repo, number = git_ops.parse_pr_url(args.pr)
-    url = source_url(pr_repo, number)
-    pr = gh.get_repo(pr_repo).get_pull(number)
+    source = load_source(gh, args.pr)
+    url = source.url
     project = open_project(gh, config)
     versions = project_versions(project, config)
     items = pr_items(project, url)
@@ -693,7 +808,7 @@ def cmd_start(args, gh: Github, config: Config) -> None:
         raise RuntimeError(f"No clone dir for {', '.join(no_dir)}; pass -C KEY=DIR or set it in the dirs file")
     if args.ai and (reason := ai.unavailable()):
         raise RuntimeError(f"--ai: {reason}")
-    if not backport(gh, project, config, pr, pr_repo, items, targets, dirs, args.ai):
+    if not backport(gh, project, config, source, items, targets, dirs, args.ai):
         sys.exit(1)
 
 
@@ -726,14 +841,13 @@ def cmd_run(args, gh: Github, config: Config) -> None:
         targets = [v for v in targets if v.key in dirs]
         if not targets:
             continue
-        pr_repo, number = git_ops.parse_pr_url(url)
         items = pr_items(project, url)
         try:
-            pr = gh.get_repo(pr_repo).get_pull(number)
-            if not pr.merged:
+            source = load_source(gh, url)
+            if source.pr and not source.pr.merged:
                 print("Source PR is not merged yet; skipped", file=sys.stderr)
                 continue
-            if not backport(gh, project, config, pr, pr_repo, items, targets, dirs, use_ai, keep_clone_clean=True):
+            if not backport(gh, project, config, source, items, targets, dirs, use_ai, keep_clone_clean=True):
                 failed = True
         except (RuntimeError, ValueError, GithubException) as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -745,8 +859,8 @@ def cmd_run(args, gh: Github, config: Config) -> None:
 
 
 def cmd_continue(args, gh: Github, config: Config) -> None:
-    pr_repo, number = git_ops.parse_pr_url(args.pr)
-    url = source_url(pr_repo, number)
+    source = load_source(gh, args.pr)
+    url = source.url
     project = open_project(gh, config)
     versions = project_versions(project, config)
     version = find_version(versions, args.version)
@@ -756,31 +870,30 @@ def cmd_continue(args, gh: Github, config: Config) -> None:
     dirs = load_dirs(args.dirs, versions)
     if version.key not in dirs:
         raise RuntimeError(f"No clone dir for {version.key}; pass -C KEY=DIR or set it in the dirs file")
-    pr = gh.get_repo(pr_repo).get_pull(number)
     repo_dir = dirs[version.key]
+    branch = backport_branch(version, url)
     check_labels(gh, config, [version])
     if args.ai and (reason := ai.unavailable()):
         raise RuntimeError(f"--ai: {reason}")
     if args.ai:
         git_ops.check_repo_dir(repo_dir)
         git_ops.check_origin(repo_dir, TARGET_REPO)
-        if git_ops.get_current_branch(repo_dir) != backport_branch(version, number):
-            raise RuntimeError(f"{repo_dir} is not on {backport_branch(version, number)}")
+        if git_ops.get_current_branch(repo_dir) != branch:
+            raise RuntimeError(f"{repo_dir} is not on {branch}")
         conflicts = git_ops.get_conflicted_entries(repo_dir)
         if conflicts:
-            if not resolve_with_ai(gh, project, config, item, version, pr, pr_repo, repo_dir, conflicts):
+            if not resolve_with_ai(gh, project, config, item, version, source, repo_dir, conflicts):
                 sys.exit(1)
             return
-    if git_ops.continue_cherry_pick(dirs[version.key], backport_branch(version, number)) == git_ops.EMPTY:
-        record_present(gh, project, item, version, pr, pr_repo, dirs[version.key])
+    if git_ops.continue_in_progress(repo_dir, branch) == git_ops.EMPTY:
+        record_present(gh, project, item, version, source, repo_dir)
         return
-    if not finish_backport(gh, project, config, item, version, pr, dirs[version.key]):
+    if not finish_backport(gh, project, config, item, version, source, repo_dir):
         sys.exit(1)
 
 
 def cmd_mark(args, gh: Github, config: Config) -> None:
-    pr_repo, number = git_ops.parse_pr_url(args.pr)
-    url = source_url(pr_repo, number)
+    url = parse_source(args.pr)
     project = open_project(gh, config)
     versions = project_versions(project, config)
     version = find_version(versions, args.version)
@@ -791,14 +904,15 @@ def cmd_mark(args, gh: Github, config: Config) -> None:
         raise ValueError("not-applicable requires --note with the reason")
     repo_dir = load_dirs(args.dirs, versions).get(version.key)
     if args.outcome == "present" and repo_dir:
-        pr = gh.get_repo(pr_repo).get_pull(number)
-        record_present(gh, project, item, version, pr, pr_repo, repo_dir, args.note, args.by)
+        record_present(gh, project, item, version, load_source(gh, url), repo_dir, args.note, args.by)
         return
-    if repo_dir and git_ops.branch_exists(repo_dir, backport_branch(version, number)):
-        git_ops.drop_backport_branch(repo_dir, version.branch, backport_branch(version, number))
+    branch = backport_branch(version, url)
+    if repo_dir and git_ops.branch_exists(repo_dir, branch):
+        git_ops.drop_backport_branch(repo_dir, version.branch, branch)
     if args.outcome == "present":
+        note = args.note or f"Already in {version.branch}"
         found = f"via {args.by}" if args.by else "introducing PR not searched (no clone dir)"
-        set_outcome(project, item, PRESENT, f"{args.note or 'Already in ' + version.branch}; {found}", args.by)
+        set_outcome(project, item, PRESENT, note if is_bump(url) else f"{note}; {found}", args.by)
     else:
         set_outcome(project, item, NOT_APPLICABLE, args.note)
 
@@ -842,8 +956,10 @@ def main() -> None:
     p.add_argument("--flavor", required=True, choices=[*FLAVORS, "both"])
     p.set_defaults(func=cmd_add_version)
 
-    p = sub.add_parser("add", parents=[common], help="Track a backport to a version and all versions it implies")
-    p.add_argument("pr", help="Source PR URL")
+    p = sub.add_parser(
+        "add", parents=[common], help="Track a backport (or bump) to a version and all versions it implies",
+    )
+    p.add_argument("pr", help="Source PR URL, or release URL for a bump")
     p.add_argument("version", help="Version key, e.g. stable-25.8")
     p.add_argument(
         "--not-needed-from", metavar="X.Y",
@@ -852,7 +968,7 @@ def main() -> None:
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("remove", parents=[common], help="Stop tracking a version and what only it implied")
-    p.add_argument("pr", help="Source PR URL")
+    p.add_argument("pr", help="Source PR URL, or release URL for a bump")
     p.add_argument("version", help="Version key, e.g. stable-25.8")
     p.set_defaults(func=cmd_remove)
 
@@ -860,8 +976,8 @@ def main() -> None:
     p.add_argument("--version", help="Only this version key")
     p.set_defaults(func=cmd_scan)
 
-    p = sub.add_parser("start", parents=[with_dirs], help="Cherry-pick, push and open backport PRs")
-    p.add_argument("pr", help="Source PR URL")
+    p = sub.add_parser("start", parents=[with_dirs], help="Cherry-pick (or merge, for a bump), push and open PRs")
+    p.add_argument("pr", help="Source PR URL, or release URL for a bump")
     p.add_argument("versions", nargs="*", help="Version keys (default: all 'Not started' for this PR)")
     p.add_argument("--ai", action="store_true", help="Let AI resolve conflicts (API if ANTHROPIC_API_KEY is set, else claude CLI)")
     p.set_defaults(func=cmd_start)
@@ -873,7 +989,7 @@ def main() -> None:
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("continue", parents=[with_dirs], help="Finish a backport after resolving conflicts")
-    p.add_argument("pr", help="Source PR URL")
+    p.add_argument("pr", help="Source PR URL, or release URL for a bump")
     p.add_argument("version", help="Version key, e.g. stable-25.8")
     p.add_argument("--ai", action="store_true", help="Let AI resolve the remaining conflicts first")
     p.set_defaults(func=cmd_continue)
@@ -881,7 +997,7 @@ def main() -> None:
     p = sub.add_parser(
         "mark", parents=[with_dirs], help="Record that a backport is already present or not applicable",
     )
-    p.add_argument("pr", help="Source PR URL")
+    p.add_argument("pr", help="Source PR URL, or release URL for a bump")
     p.add_argument("version", help="Version key, e.g. stable-25.8")
     p.add_argument("outcome", choices=["present", "not-applicable"])
     p.add_argument("--by", help="URL of the PR that already brought the change (present)")

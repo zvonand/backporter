@@ -9,6 +9,8 @@ branch, with only two regions filled from the source PR.
 
 Everything else, CI/CD options and their checkbox states included, stays byte-for-byte as in the template.
 When the source PR is unclear, the AI fills the two regions instead, and its result must pass the same check.
+
+A bump PR's body is the same template with only the category filled: the template's own "Not for changelog" choice.
 """
 
 import re
@@ -78,13 +80,19 @@ def attribute(entry: list[str], url: str, author: str) -> list[str]:
     return [*entry[:-1], f"{last} ({url} by @{author})"]
 
 
-def fill(template: str, category: str, entry: list[str]) -> str:
-    """The template with its category choices replaced by `category` and its entry placeholder by `entry`."""
-    lines = template.split("\n")
+def _category_choices(lines: list[str]) -> list[int]:
+    """Indexes of the template's changelog category choices."""
     start, end = _section(lines, _CATEGORY_RE, TemplateError)
     items = [i for i in range(start + 1, end) if _ITEM_RE.match(lines[i])]
     if not items or items != list(range(items[0], items[-1] + 1)):
         raise TemplateError("the template's changelog categories are not one contiguous list")
+    return items
+
+
+def fill(template: str, category: str, entry: list[str]) -> str:
+    """The template with its category choices replaced by `category` and its entry placeholder by `entry`."""
+    lines = template.split("\n")
+    items = _category_choices(lines)
     lines[items[0]:items[-1] + 1] = [category]
 
     start, end = _section(lines, _ENTRY_RE, TemplateError)
@@ -99,6 +107,17 @@ def build(template: str, source_body: str, url: str, author: str) -> str:
     """Deterministic body; raises Unclear if the source needs judgment, TemplateError if the template is unusable."""
     category, entry = source_parts(source_body)
     return fill(template, category, attribute(entry, url, author))
+
+
+def not_for_changelog(template: str) -> str:
+    """Bump body: the template with its category choices replaced by its own 'Not for changelog' choice."""
+    lines = template.split("\n")
+    items = _category_choices(lines)
+    chosen = [lines[i] for i in items if "not for changelog" in lines[i].lower()]
+    if len(chosen) != 1:
+        raise TemplateError(f"expected one 'Not for changelog' category in the template, found {len(chosen)}")
+    lines[items[0]:items[-1] + 1] = chosen
+    return "\n".join(lines)
 
 
 def check(template: str, body: str, url: str, author: str) -> None:

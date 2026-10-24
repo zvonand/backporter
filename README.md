@@ -1,6 +1,6 @@
 # backporter
 
-Tracks and performs ClickHouse backports to our versions. All tracking data lives in a GitHub Project; the tool keeps no local state besides the list of local clone dirs.
+Tracks and performs ClickHouse backports to our versions, and bumps (merging an upstream release into a version). All tracking data lives in a GitHub Project; the tool keeps no local state besides the list of local clone dirs.
 
 Project: https://github.com/orgs/Altinity/projects/39
 
@@ -32,6 +32,18 @@ Version keys look like `stable-25.8` or `antalya-26.3`. Each version has its own
 
 A request is skipped, and stays in **Requests**, if it has no PR link, no version, or a version key the project doesn't have. `scan` prints the reason. Fix the row and it's picked up next time.
 
+### Requesting a bump
+
+A bump merges an upstream release into a version: its tag (e.g. `v26.3.53.4-lts`) is fetched from upstream and merged into the version's branch. Request it like a backport, with the release's link instead of a PR's:
+
+1. In **Requests**, paste the release link, e.g. `https://github.com/ClickHouse/ClickHouse/releases/tag/v26.3.53.4-lts`, and press **Cmd+Enter** (Ctrl+Enter on Linux/Windows) to create a draft. Plain Enter would create a real issue.
+2. In **Version**, pick the version to bump. It must be the release's X.Y.
+3. The next `scan` tracks the bump for **every flavor of that X.Y and nothing else**: a bump of `stable-26.3` also brings `antalya-26.3`, but not 26.6, 26.8 or 25.8.
+
+Everything else works as for backports: Decision, Status, `run`, `start`, `continue`, `mark` and `remove`, which all take the release link in place of a PR link. A bump request is skipped if its version isn't the release's X.Y, or if **Not needed from** is set (it doesn't apply to bumps). On the command line: `backporter add https://github.com/ClickHouse/ClickHouse/releases/tag/v26.3.53.4-lts stable-26.3`.
+
+A bump PR follows the team's convention: branch `bump/<branch>/<X.Y.Z>`, title `<Stable|Antalya> X.Y: Bump to X.Y.Z`, a merge commit `Merge tag '<tag>' into bump/<branch>/<X.Y.Z>`, and the same labels and builds project as a backport PR. If the tag is already in the branch, the item becomes `Already present`.
+
 ### From the command line
 
 ```bash
@@ -45,7 +57,7 @@ This creates the items immediately. To undo it, run `backporter remove <PR> <ver
 Two columns, with separate owners:
 
 - **Decision** is yours. Set it in any view; empty means undecided, and nothing is backported until someone decides.
-  - **`Approved`**: do it. The next `backporter run` backports it: cherry-pick, push, and a labeled PR in `Altinity/ClickHouse`. AI resolves conflicts by default.
+  - **`Approved`**: do it. The next `backporter run` backports it: cherry-pick (for a bump: merge the release's tag), push, and a labeled PR in `Altinity/ClickHouse`. AI resolves conflicts by default.
   - **`Discarded`**: don't do it. The item stays as a record, and the backporter never touches it again.
 - **Status** belongs to the backporter. Don't edit it. Together with **Note**, it shows what happened. Once a backport PR exists, the row *is* that PR, so its title links to it:
 
@@ -111,7 +123,7 @@ The token is used for the GitHub API only. `git fetch`/`git push` in the clone d
 
 - `project_owner`, `project_number`: the project, written by `backporter init <project-URL>`.
 - `[run]`: `ai = true` turns on AI conflict resolution by default in `backporter run`.
-- `[labels]`: labels added to every backport PR the backporter opens.
+- `[labels]`: labels added to every backport and bump PR the backporter opens.
   - `all` applies to every PR.
   - A flavor (`stable`, `antalya`) adds labels for that flavor.
   - A version key (e.g. `"antalya-25.8"`) adds labels for that version.
@@ -127,7 +139,7 @@ The token is used for the GitHub API only. `git fetch`/`git push` in the clone d
 
   With this config, a backport into `antalya-25.8` gets `backport`, `antalya` and `antalya-25.8`, and one into `stable-25.8` gets `backport`, `stable`, `25.8` and `stable-25.8`. The committed config follows the team's backport PR convention for every version. Labels must already exist in `Altinity/ClickHouse`; the backporter never creates them. `start` and `continue` check this before any git work and stop on a missing label.
 
-- `[builds]`: the team's builds projects that backport PRs are also added to, once, per flavor: project number, the text field that gets the version number, and the Status for a newly added open PR. Currently stable goes to project 26 (Stable Builds, "Port Versions") and antalya to project 17 (Project Antalya, "Release Versions (Major)"), both with Status "Needs Review".
+- `[builds]`: the team's builds projects that backport and bump PRs are also added to, once, per flavor: project number, the text field that gets the version number, and the Status for a newly added open PR. Currently stable goes to project 26 (Stable Builds, "Port Versions") and antalya to project 17 (Project Antalya, "Release Versions (Major)"), both with Status "Needs Review".
 - `[branches]`: the branch in `Altinity/ClickHouse` for each version key. Branch names don't follow one pattern, so each is listed explicitly:
 
   ```toml
@@ -143,15 +155,15 @@ Everything else, including the list of versions, lives in the project.
 
 ## Safety: the only destination is Altinity/ClickHouse
 
-Source PRs may come from `ClickHouse/ClickHouse`, but the backporter only ever reads from it. It never writes anything there: no PRs, comments, reviews, labels, edits or issues. Its only comment anywhere is the conflict summary on a backport PR it opened in `Altinity/ClickHouse` (see `start`).
+Source PRs and releases may come from `ClickHouse/ClickHouse`, but the backporter only ever reads from it. It never writes anything there: no PRs, comments, reviews, labels, edits or issues. Its only comment anywhere is the conflict summary on a backport or bump PR it opened in `Altinity/ClickHouse` (see `start`).
 
 The target repo is hardcoded (`TARGET_REPO` in `backporter/config.py`) and is not configurable.
 
 **GitHub API allowlist** (`backporter/github_guard.py`): every request PyGithub makes, including redirects, is checked before it is sent. Allowed:
 - reads (`GET`/`HEAD`);
-- `POST /repos/Altinity/ClickHouse/pulls` (opening a backport PR);
+- `POST /repos/Altinity/ClickHouse/pulls` (opening a backport or bump PR);
 - `POST /repos/Altinity/ClickHouse/issues/<n>/labels` (adding the configured labels to it; labels are never removed or created);
-- `POST /repos/Altinity/ClickHouse/issues/<n>/comments`, only for a backport PR the backporter just opened or reused (registered with the guard by number), for the AI conflict summary;
+- `POST /repos/Altinity/ClickHouse/issues/<n>/comments`, only for a backport or bump PR the backporter just opened or reused (registered with the guard by number), for the AI conflict summary;
 - `POST /orgs/Altinity/projectsV2/<n>/views` (creating a project view; only this REST call can set a view's grouping);
 - a GraphQL mutation only if it is a single operation whose top-level fields are all project mutations: `createProjectV2Field`, `updateProjectV2Field`, `createProjectV2View`, `updateProjectV2View`, `deleteProjectV2View`, `addProjectV2DraftIssue`, `updateProjectV2ItemFieldValue`, `clearProjectV2ItemFieldValue`, `deleteProjectV2Item`, and `addProjectV2ItemById` only for a PR the code has just verified to be in `Altinity/ClickHouse` (registered with the guard by its node id). Fields are never deleted.
 
@@ -160,7 +172,7 @@ Anything else is refused with an error. If the installed PyGithub doesn't have t
 **Git:**
 
 - **Before any git work and before every push:** every push URL of `origin` in the clone dir must point to `github.com/Altinity/ClickHouse`. The URLs are read with `git remote get-url --push --all origin`, so `insteadOf`/`pushInsteadOf` rewrites are applied. Otherwise the command refuses. `start` checks all the clone dirs it will use before it starts.
-- **Pushes:** only to `origin`, with an explicit `refs/heads/<branch>:refs/heads/<branch>` refspec. The `upstream` remote (the source PR's repo) is only fetched from.
+- **Pushes:** only to `origin`, with an explicit `refs/heads/<branch>:refs/heads/<branch>` refspec, so fetched upstream tags are never pushed. The `upstream` remote (the source PR's or release's repo) is only fetched from.
 - **PRs:** opened only via the API in `Altinity/ClickHouse`, after checking that the resolved repo name is exactly that. A rename or redirect is refused.
 
 ## The GitHub Project
@@ -173,16 +185,17 @@ Propagation rules:
 
 - A backport to **stable X** also requires every stable version ≥ X **and** every antalya version ≥ X.
 - A backport to **antalya X** also requires every antalya version ≥ X.
+- A bump of **any flavor of X.Y** requires every flavor of X.Y, and no other version.
 
 Example: with stable 25.3, 25.8, 26.3, 26.8 and antalya 25.8, 26.3, 26.6, 26.8, `stable-25.3` implies all the others, and `antalya-26.3` implies `antalya-26.6` and `antalya-26.8`.
 
 ### Items
 
-Each item is one (source PR, version) pair. It starts as a draft titled `<owner/repo>#<N> <source PR title>`, with the source PR URL as its body. When a backport PR exists (opened by the backporter, or opened by hand and found by `scan`), the draft is **replaced by that PR itself**, with all field values copied. The Title column, which GitHub always shows first, then is the backport PR: clickable, with its state. Only `Altinity/ClickHouse` PRs are ever added this way. Fields:
+Each item is one (source PR, version) pair, or (release, version) for a bump. It starts as a draft titled `<owner/repo>#<N> <source PR title>` (`Bump to <tag>` for a bump), with the source URL as its body. When a backport PR exists (opened by the backporter, or opened by hand and found by `scan`), the draft is **replaced by that PR itself**, with all field values copied. The Title column, which GitHub always shows first, then is the backport PR: clickable, with its state. Only `Altinity/ClickHouse` PRs are ever added this way. Fields:
 
 | Field | Meaning |
 |-------|---------|
-| Source PR | URL of the PR being backported |
+| Source PR | URL of the PR being backported, or of the release for a bump |
 | Version | Version key, e.g. `stable-25.8` |
 | Flavor | `stable` / `antalya` |
 | Requested | `explicit` (named in `add` or a request) or `implied` (required by the propagation rules) |
@@ -197,7 +210,7 @@ Draft items can't have comments, so the explanation goes in `Note`. Notes and fo
 ### Views
 
 - One table view per version, named by its key, filtered with `version:"<key>" has:requested` (tracked rows only, so unprocessed requests stay in `Requests`) and grouped by Status. For example, open the `stable-25.8` view to see everything going into stable 25.8. Grouping can only be set when a view is created (via the REST API), so views created by older versions of the backporter have to be recreated to get it.
-- `Requests`: the first tab, which the project opens with. It shows requests added in the web page that `scan` hasn't processed yet (filter `no:requested`), so a processed request disappears from it, replaced by tracked items in the version views. See [Requesting a backport](#requesting-a-backport). GitHub can't reorder tabs through the API, so `init` turns GitHub's default first view ("View 1") into `Requests`. If someone has already customized the first view, `init` leaves it alone and asks you to drag the `Requests` tab to the front.
+- `Requests`: the first tab, which the project opens with. It shows requests added in the web page that `scan` hasn't processed yet (filter `no:requested`), so a processed request disappears from it, replaced by tracked items in the version views. See [Requesting a backport](#requesting-a-backport) and [Requesting a bump](#requesting-a-bump). GitHub can't reorder tabs through the API, so `init` turns GitHub's default first view ("View 1") into `Requests`. If someone has already customized the first view, `init` leaves it alone and asks you to drag the `Requests` tab to the front.
 - `All`: a board of all tracked rows (filter `has:requested`).
 
 `init` and `add-version` set up the columns of every view. Views created through the API would otherwise show only GitHub's defaults.
@@ -235,7 +248,7 @@ The project is the source of truth. People set Decision (and the request cells);
 
 ## Usage
 
-`--token` and `-C` go after the subcommand, e.g. `backporter start -C ... <PR-URL>`. `<PR-URL>` is a merged or unmerged PR in any repo, typically `ClickHouse/ClickHouse` or `Altinity/ClickHouse`.
+`--token` and `-C` go after the subcommand, e.g. `backporter start -C ... <PR-URL>`. `<PR-URL>` is a merged or unmerged PR in any repo, typically `ClickHouse/ClickHouse` or `Altinity/ClickHouse`. `add`, `remove`, `start`, `continue` and `mark` also take a release URL instead, for a [bump](#requesting-a-bump).
 
 ### `add-version`
 
@@ -259,6 +272,7 @@ The command-line equivalent of a web request, with Requested by = the token's ow
 - `--not-needed-from` works like the request's **Not needed from** cell: implied versions from X.Y up get `Not applicable` rows.
 - Items that already exist are left as they are, except that an `implied` item for `<version>` becomes `explicit`, and a `Discarded` one is reopened (see [Requesting again](#requesting-a-backport)).
 - Re-running is safe and fills in any missing implied items.
+- With a release URL instead of `<PR-URL>`, it tracks a [bump](#requesting-a-bump): `<version>` must be the release's X.Y, and `--not-needed-from` isn't allowed.
 
 ### `remove`
 
@@ -279,7 +293,7 @@ backporter scan [--version KEY]
 ```
 
 1. Processes requests added in the web page (see [Requesting a backport](#requesting-a-backport)): each requested version is handled like `add`, then the request row is deleted.
-2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`, and not `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>`, so backports opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`), turns a draft row into that PR's row, and adds the PR to its builds project if it isn't there yet. A merged PR is added without a Status; a closed one isn't added.
+2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`, and not `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>` (`bump/<branch>/<X.Y.Z>` for a bump), so backports and bumps opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`), turns a draft row into that PR's row, and adds the PR to its builds project if it isn't there yet. A merged PR is added without a Status; a closed one isn't added.
 3. Lists items still `Not started` or in `Conflicts`, grouped by version, with their Decision. `Discarded` items are left out.
 4. Reports PRs that are missing versions implied by their explicit requests.
 
@@ -291,17 +305,18 @@ backporter scan [--version KEY]
 backporter start <PR-URL> [<version> ...] [--ai]
 ```
 
-Backports a merged PR right away. Running it counts as the decision, so no approval is needed. Without versions it takes all of the PR's `Not started` items that aren't `Discarded`; with versions it takes those (they must already be added, in any status). Every version needs a clone dir (see below). The versions are processed oldest first, and for each one, in its clone dir, it:
+Backports a merged PR (or, given a release URL, does a bump) right away. Running it counts as the decision, so no approval is needed. Without versions it takes all of the PR's `Not started` items that aren't `Discarded`; with versions it takes those (they must already be added, in any status). Every version needs a clone dir (see below). The versions are processed oldest first, and for each one, in its clone dir, it:
 
 1. Fetches and checks out the target branch and pulls it.
 2. Creates `backports/<branch>/<N>`.
 3. Cherry-picks the PR's merge commit with `-m 1`. If the PR is not from `Altinity/ClickHouse`, the commit is fetched from an `upstream` remote, which is added or updated automatically.
+   For a bump, the branch is `bump/<branch>/<X.Y.Z>` and this step fetches only the release's tag from `upstream` and runs `git merge --no-ff <tag>`.
 4. Pushes the branch to `origin`.
 5. Opens a PR into the target branch titled `<Stable|Antalya> X.Y Backport of #N - <exact source PR title>`, with the labels configured for its version (see Configuration). If an open PR already exists for the branch, it is reused. The body is built before anything is pushed (see [PR body](#pr-body)).
 6. Replaces the draft row by the backport PR (same field values), and sets `Backport PR` and Status `PR open`.
 7. Adds the backport PR to its flavor's builds project (see `[builds]`), unless it's already there: the version number goes in that project's version field, and Status is set to the configured one (e.g. "Needs Review"). Nothing there is changed afterwards; QA and release status stay with people.
 
-**Already present.** If the cherry-pick turns out empty, the change is already in the target branch. The tool then:
+**Already present.** For a bump: the tag is already in the target branch, so the branch is dropped and the item is marked `Already present` with that in `Note`. For a backport: if the cherry-pick turns out empty, the change is already in the target branch. The tool then:
 1. Drops the local backport branch.
 2. Sets Status `Already present`.
 3. Looks for the PR that brought the change, and records it in `Backport PR` and `Note`:
@@ -312,14 +327,14 @@ It then continues with the next version.
 
 **Conflicts without `--ai`.** It sets Status `Conflicts`, prints the conflicted files, leaves the branch with conflicts in the clone dir, and stops (exit code 1). Versions after it are not started.
 
-**Conflicts with `--ai`.** The backporter first commits the cherry-pick **as-is, with the conflict markers**. That commit keeps the original message and adds "Conflicts committed as-is; the next commit resolves them" and the list of files. The AI then resolves the conflicts in the clone dir (see [AI conflict resolution](#ai-conflict-resolution)) and reports one outcome. A successful resolution becomes a **second, separate commit**, so reviewers see exactly what the AI changed.
+**Conflicts with `--ai`.** The backporter first commits the cherry-pick (for a bump, the merge) **as-is, with the conflict markers**. That commit keeps the original message and adds "Conflicts committed as-is; the next commit resolves them" and the list of files. The AI then resolves the conflicts in the clone dir (see [AI conflict resolution](#ai-conflict-resolution)) and reports one outcome. A successful resolution becomes a **second, separate commit**, so reviewers see exactly what the AI changed.
 
 | AI outcome | What the backporter does |
 |---|---|
-| `RESOLVED` | Checks that HEAD hasn't moved and no conflict markers are left, then commits the resolution ("Resolve conflicts in backport of #N" with the AI's note). It continues with steps 4–6, writes `AI resolved conflicts: <note>` to `Note`, and posts **one comment on the backport PR** with the conflicted files, the two commits and the AI's short summary of what conflicted and how it was resolved. If the branch ends up identical to the target branch, the item is marked `Already present` as above. |
-| `ALREADY_PRESENT` | Drops the branch and marks `Already present`, using the PR the AI names or, failing that, the lookup above. |
-| `NOT_APPLICABLE` | Drops the branch and marks `Not applicable` with the AI's reason in `Note`. |
-| `UNRESOLVED` | Undoes the conflict commit and redoes the cherry-pick, so the conflicts are in progress again for a human (`continue`). Sets `Conflicts` with the AI's reason in `Note`, and stops. |
+| `RESOLVED` | Checks that HEAD hasn't moved and no conflict markers are left, then commits the resolution ("Resolve conflicts in backport of #N" with the AI's note). It continues with steps 4–6, writes `AI resolved conflicts: <note>` to `Note`, and posts **one comment on the backport PR** with the conflicted files, the two commits and the AI's short summary of what conflicted and how it was resolved. If a backport's branch ends up identical to the target branch, the item is marked `Already present` as above; a bump's merge is kept. |
+| `ALREADY_PRESENT` | Drops the branch and marks `Already present`, using the PR the AI names or, failing that, the lookup above. Not offered for a bump. |
+| `NOT_APPLICABLE` | Drops the branch and marks `Not applicable` with the AI's reason in `Note`. Not offered for a bump. |
+| `UNRESOLVED` | Undoes the conflict commit and redoes the cherry-pick (or merge), so the conflicts are in progress again for a human (`continue`). Sets `Conflicts` with the AI's reason in `Note`, and stops. |
 
 If the backport branch already exists locally, or the clone is in a conflicted/dirty state, it asks before recreating the branch from a clean target. Answering no aborts.
 
@@ -348,8 +363,8 @@ The run exits with code 1 if anything failed or needs a human.
 backporter continue <PR-URL> <version> [--ai]
 ```
 
-Use after resolving the conflicts left by `start`. The clone dir must be on `backports/<branch>/<N>` with the cherry-pick in progress. It runs `git add .` and `git cherry-pick --continue`, then does steps 4–6 of `start`.
-- If the resolution leaves no changes, the item is marked `Already present` instead.
+Use after resolving the conflicts left by `start`. The clone dir must be on `backports/<branch>/<N>` with the cherry-pick in progress (for a bump: on `bump/<branch>/<X.Y.Z>` with the merge in progress). It runs `git add .` and `git cherry-pick --continue` (`git merge --continue`), then does steps 4–6 of `start`.
+- If a backport's resolution leaves no changes, the item is marked `Already present` instead. A bump's merge is always committed.
 - With `--ai`, the AI first resolves whatever conflicts remain, with the same outcomes as `start --ai`.
 
 To continue with the remaining versions, run `start <PR-URL>` again.
@@ -382,6 +397,8 @@ A backport PR's body is the **`.github/PULL_REQUEST_TEMPLATE.md` of Altinity/Cli
 
 Everything else stays byte-for-byte as in the template, in particular the **CI/CD options and their checkbox states**, so every backport gets the default branch's current CI/CD defaults. Nothing else is copied from the source PR, including its CI/CD selections.
 
+A **bump** PR's body is the same template with only the category list replaced by the template's own `Not for changelog` choice. The entry placeholder stays as it is.
+
 **Unclear source PR.** The code handles the normal case. The AI ([AI conflict resolution](#ai-conflict-resolution) explains which backend) gets a prompt with the template, the source PR body and these same rules when:
 - the source PR selects no category or several;
 - its entry is empty or a placeholder;
@@ -395,7 +412,7 @@ If neither the code nor the AI produces a valid body (or no AI is available, or 
 
 ## AI conflict resolution
 
-`run` (unless `--no-ai` or `[run] ai = false`), `start --ai` and `continue --ai` hand conflicts to Claude:
+`run` (unless `--no-ai` or `[run] ai = false`), `start --ai` and `continue --ai` hand conflicts to Claude, for backports and bumps alike (a bump's prompt asks to keep both upstream's and Altinity's changes, and offers only `RESOLVED` or `UNRESOLVED`):
 
 - **Anthropic API**, when `ANTHROPIC_API_KEY` is set. The backporter runs the agent loop itself (`backporter/ai_api.py`, model `claude-opus-5-5`), and its tools run locally:
   - `bash` runs one command without a shell. Allowed: `git status/diff/log/show/grep/blame/ls-files/merge-base/rev-parse/cat-file/add/rm`, `git checkout --ours|--theirs`, and `ls/cat/head/tail/grep/rg/wc` on paths inside the repo.
