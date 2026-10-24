@@ -762,12 +762,17 @@ def backport(
         git_ops.check_repo_dir(dirs[v.key])
         git_ops.check_origin(dirs[v.key], TARGET_REPO)
     check_labels(gh, config, targets)
+    repo = gh.get_repo(TARGET_REPO)
 
     ok = True
     for v in sort_versions(targets):
         item = items[v.key]
         print(f"\n=== {v.key} ===")
-        outcome, conflicts = apply(dirs[v.key], TARGET_REPO, v.branch, backport_branch(v, source.url), source.repo, ref)
+        # A leftover local branch of an attempt that got no PR is recreated without asking.
+        replace = item.status == NOT_STARTED and find_backport_pr(repo, item, v) is None
+        outcome, conflicts = apply(
+            dirs[v.key], TARGET_REPO, v.branch, backport_branch(v, source.url), source.repo, ref, replace
+        )
         if outcome == git_ops.EMPTY:
             record_present(gh, project, item, v, source, dirs[v.key])
             continue

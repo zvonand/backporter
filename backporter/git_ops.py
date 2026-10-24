@@ -181,8 +181,11 @@ def merge_command(tag: str) -> list[str]:
     return ["git", "merge", "--no-ff", "--no-edit", tag]
 
 
-def _start_branch(repo_dir: str, target_repo: str, target_branch: str, backport_branch: str) -> None:
-    """Create backport_branch from the fresh target_branch in repo_dir (asking before discarding local state)."""
+def _start_branch(repo_dir: str, target_repo: str, target_branch: str, backport_branch: str, replace: bool) -> None:
+    """
+    Create backport_branch from the fresh target_branch in repo_dir (asking before discarding local state).
+    With replace, an existing local backport_branch is recreated without asking.
+    """
     check_repo_dir(repo_dir)
     check_origin(repo_dir, target_repo)
     print(f"Fetching latest {target_branch} from {target_repo}...")
@@ -203,7 +206,8 @@ def _start_branch(repo_dir: str, target_repo: str, target_branch: str, backport_
         run(["git", "pull", "origin", target_branch], cwd=repo_dir, stream=True)
 
     if branch_exists(repo_dir, backport_branch):
-        if not prompt_yes_no(f"Branch '{backport_branch}' already exists. Delete and recreate from clean target?"):
+        question = f"Branch '{backport_branch}' already exists. Delete and recreate from clean target?"
+        if not replace and not prompt_yes_no(question):
             raise RuntimeError("Aborted")
         run(["git", "branch", "-D", backport_branch], cwd=repo_dir)
 
@@ -234,14 +238,15 @@ def _conflicts_or_fail(repo_dir: str, result: subprocess.CompletedProcess, cmd: 
 
 
 def cherry_pick(
-    repo_dir: str, target_repo: str, target_branch: str, backport_branch: str, pr_repo: str, merge_sha: str
+    repo_dir: str, target_repo: str, target_branch: str, backport_branch: str, pr_repo: str, merge_sha: str,
+    replace: bool,
 ) -> tuple[str, list[tuple[str, str]]]:
     """
     Create backport_branch from the fresh target_branch in repo_dir and cherry-pick merge_sha.
     Returns (PICKED | EMPTY | CONFLICTS, conflicted entries). EMPTY means the change is already in
     target_branch. On CONFLICTS the cherry-pick is left in progress for resolving.
     """
-    _start_branch(repo_dir, target_repo, target_branch, backport_branch)
+    _start_branch(repo_dir, target_repo, target_branch, backport_branch, replace)
     _fetch_source(repo_dir, target_repo, pr_repo, merge_sha)
 
     print("Cherry-picking merge commit...")
@@ -255,14 +260,14 @@ def cherry_pick(
 
 
 def merge_tag(
-    repo_dir: str, target_repo: str, target_branch: str, bump_branch: str, source_repo: str, tag: str
+    repo_dir: str, target_repo: str, target_branch: str, bump_branch: str, source_repo: str, tag: str, replace: bool
 ) -> tuple[str, list[tuple[str, str]]]:
     """
     Create bump_branch from the fresh target_branch in repo_dir and merge source_repo's tag into it (--no-ff).
     Returns (PICKED | EMPTY | CONFLICTS, conflicted entries). EMPTY means the tag is already in target_branch.
     On CONFLICTS the merge is left in progress for resolving.
     """
-    _start_branch(repo_dir, target_repo, target_branch, bump_branch)
+    _start_branch(repo_dir, target_repo, target_branch, bump_branch, replace)
     # Only this tag: tags of upstream's whole history would otherwise come along.
     _fetch_source(repo_dir, target_repo, source_repo, "--no-tags", f"+refs/tags/{tag}:refs/tags/{tag}")
     if is_ancestor(repo_dir, f"refs/tags/{tag}", "HEAD"):
