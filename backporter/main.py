@@ -39,6 +39,7 @@ from backporter.config import (
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
     APPROVED, DISCARDED, F_DECISION, F_NOT_NEEDED_FROM, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
+    ACTIVE_FILTER, REQUESTS_FILTER, TRACKED_FILTER, source_filter,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -46,6 +47,8 @@ from backporter.rules import closure, plan_remove, sort_versions
 _VERSION_KEY_RE = re.compile(r"\b(?:stable|antalya)-\d+\.\d+\b")
 # AI attempts at a CI fix that builds, in `inspect`.
 BUILD_ATTEMPTS = 3
+# Source PRs per filtered project read; GitHub doesn't document the filter's length limit (120 URLs worked).
+SOURCES_PER_READ = 50
 
 
 def source_url(pr_repo: str, number: int) -> str:
@@ -140,9 +143,9 @@ def open_project(gh: Github, config: Config) -> Project:
     return project
 
 
-def tracked_items(project: Project) -> list[Item]:
-    """Items created by the backporter (not requests, not processed source PR rows)."""
-    return [i for i in project.items() if i.requested in (EXPLICIT, IMPLIED)]
+def tracked_items(project: Project, query: str | None = None) -> list[Item]:
+    """Items created by the backporter (not requests, not processed source PR rows), only those matching query."""
+    return [i for i in project.items(query) if i.requested in (EXPLICIT, IMPLIED)]
 
 
 def project_versions(project: Project, config: Config) -> list[Version]:
@@ -156,7 +159,7 @@ def project_versions(project: Project, config: Config) -> list[Version]:
 
 def pr_items(project: Project, url: str) -> dict[str, Item]:
     """Version key -> item for one source PR."""
-    return {i.version: i for i in tracked_items(project) if i.source_pr == url}
+    return {i.version: i for i in tracked_items(project, source_filter([url])) if i.source_pr == url}
 
 
 def create_item(
@@ -440,7 +443,7 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
     """
     keys = set(project.version_keys())
     created: list[Item] = []
-    for item in project.items():
+    for item in project.items(REQUESTS_FILTER):
         if item.requested:
             continue
         text = " ".join((item.source_pr, item.content_url, item.title, item.body))
@@ -518,7 +521,7 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
         find_version(version_list, only_version)
     versions = {v.key: v for v in version_list}
     repo = gh.get_repo(TARGET_REPO)
-    items = tracked_items(project)
+    items = tracked_items(project, ACTIVE_FILTER)
     listed = {i.id for i in items}
     items += [i for i in created if i.id not in listed]
 
@@ -559,8 +562,13 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
             for item in pending[v.key]:
                 print(f"  {item.status:<12} {item.decision or 'undecided':<10} {item.source_pr}  {item.title}")
 
+    # Only active rows were read; the check needs every row of their source PRs.
+    rows = {i.id: i for i in items}
+    urls = list(dict.fromkeys(i.source_pr for i in items))
+    for n in range(0, len(urls), SOURCES_PER_READ):
+        rows.update({i.id: i for i in tracked_items(project, source_filter(urls[n:n + SOURCES_PER_READ]))})
     by_pr: dict[str, list[Item]] = defaultdict(list)
-    for item in items:
+    for item in rows.values():
         by_pr[item.source_pr].append(item)
     for url, its in by_pr.items():
         present = {i.version for i in its}
@@ -826,7 +834,7 @@ def cmd_run(args, gh: Github, config: Config) -> None:
         print(f"AI conflict resolution is off for this run: {reason}", file=sys.stderr)
         use_ai = False
     approved: dict[str, list[Item]] = defaultdict(list)
-    for item in tracked_items(project):
+    for item in tracked_items(project, ACTIVE_FILTER):
         if item.status == NOT_STARTED and item.decision == APPROVED:
             approved[item.source_pr].append(item)
     if not approved:
@@ -844,7 +852,7 @@ def cmd_run(args, gh: Github, config: Config) -> None:
         targets = [v for v in targets if v.key in dirs]
         if not targets:
             continue
-        items = pr_items(project, url)
+        items = {i.version: i for i in its}
         try:
             source = load_source(gh, url)
             if source.pr and not source.pr.merged:
@@ -1009,8 +1017,9 @@ def cmd_inspect(args, gh: Github, config: Config) -> None:
     def inspectable(i: Item) -> bool:
         return i.status == PR_OPEN and bool(i.backport_pr) and i.decision != DISCARDED
 
+    query = f'{TRACKED_FILTER} status:"{PR_OPEN}" -decision:{DISCARDED}'
     items = [
-        i for i in tracked_items(project)
+        i for i in tracked_items(project, query)
         if inspectable(i) and (not args.version or i.version == args.version)
     ]
     if not items:
@@ -1027,9 +1036,9 @@ def cmd_inspect(args, gh: Github, config: Config) -> None:
             continue
         try:
             # The project may have changed during earlier inspections.
-            item = next((i for i in project.items() if i.id == item.id), None)
+            item = next((i for i in project.items(query) if i.id == item.id), None)
             if item is None:
-                print("No longer in the project; skipped")
+                print("No longer an open backport PR in the project; skipped")
                 continue
             if not inspectable(item):
                 print(f"Now {item.status}{', ' + item.decision if item.decision else ''} in the project; skipped")

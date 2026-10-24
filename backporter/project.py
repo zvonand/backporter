@@ -69,7 +69,7 @@ _OWN_FIELDS = {
 _CUSTOM_FIELD_TYPES = {"TEXT", "SINGLE_SELECT", "MULTI_SELECT", "NUMBER", "DATE", "ITERATION"}
 
 # GitHub sometimes answers project queries with an empty result (seen with totalCount 0 for a project
-# with items), so empty answers are re-read a few times before being trusted.
+# with items), so empty answers to unfiltered reads are re-read a few times before being trusted.
 _READ_ATTEMPTS = 5
 _RETRY_SECONDS = 3
 
@@ -92,10 +92,10 @@ query($id: ID!) {
 """
 
 _ITEMS_QUERY = """
-query($id: ID!, $after: String) {
+query($id: ID!, $after: String, $query: String) {
   node(id: $id) {
     ... on ProjectV2 {
-      items(first: 100, after: $after) {
+      items(first: 100, after: $after, query: $query) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id
@@ -140,6 +140,16 @@ class Item:
 
 # Tracked rows only: unprocessed requests (no Requested value yet) belong in the Requests view.
 TRACKED_FILTER = "has:requested"
+REQUESTS_FILTER = "no:requested"
+# Tracked rows the backporter still works on.
+ACTIVE_FILTER = (
+    f"{TRACKED_FILTER} -status:" + ",".join(f'"{s}"' for s in FINAL_STATUSES) + f" -decision:{DISCARDED}"
+)
+
+
+def source_filter(urls: list[str]) -> str:
+    """Rows of any of the source PRs (or releases) at urls."""
+    return "source-pr:" + ",".join(f'"{u}"' for u in urls)
 
 
 def _version_filter(key: str) -> str:
@@ -304,7 +314,7 @@ class Project:
             self.requester.graphql_named_mutation(
                 "updateProjectV2View",
                 {
-                    "viewId": first["id"], "name": REQUESTS_VIEW, "layout": "TABLE_LAYOUT", "filter": "no:requested",
+                    "viewId": first["id"], "name": REQUESTS_VIEW, "layout": "TABLE_LAYOUT", "filter": REQUESTS_FILTER,
                     "configuration": {"visibleFieldIds": columns},
                 },
                 "clientMutationId",
@@ -312,7 +322,7 @@ class Project:
             print(f"Turned the first view into '{REQUESTS_VIEW}'")
         else:
             if REQUESTS_VIEW not in self.views:
-                self._create_view(REQUESTS_VIEW, "TABLE_LAYOUT", "no:requested")
+                self._create_view(REQUESTS_VIEW, "TABLE_LAYOUT", REQUESTS_FILTER)
             print(f"The first view is '{first['name']}'; drag the '{REQUESTS_VIEW}' tab to the front to open with it")
         self._load_fields()
 
@@ -387,21 +397,22 @@ class Project:
 
     # --- items ---
 
-    def items(self) -> list[Item]:
+    def items(self, query: str | None = None) -> list[Item]:
+        """All items, or those matching query (in the project's filter syntax), which may legitimately be none."""
         for attempt in range(_READ_ATTEMPTS):
-            result = self._read_items()
-            if result:
+            result = self._read_items(query)
+            if result or query:
                 return result
             if attempt < _READ_ATTEMPTS - 1:
                 print("GitHub returned no project items; re-checking...", file=sys.stderr)
                 time.sleep(_RETRY_SECONDS)
         return []
 
-    def _read_items(self) -> list[Item]:
+    def _read_items(self, query: str | None) -> list[Item]:
         result: list[Item] = []
         after = None
         while True:
-            _, data = self.requester.graphql_query(_ITEMS_QUERY, {"id": self.id, "after": after})
+            _, data = self.requester.graphql_query(_ITEMS_QUERY, {"id": self.id, "after": after, "query": query})
             page = data["data"]["node"]["items"]
             for node in page["nodes"]:
                 values = {}
