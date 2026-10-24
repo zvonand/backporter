@@ -4,8 +4,8 @@ Allowlist for every GitHub API request the backporter makes.
 Reads (GET/HEAD) are allowed. The only allowed writes are:
 - opening a PR in TARGET_REPO (POST /repos/<TARGET_REPO>/pulls);
 - adding labels to a PR/issue in TARGET_REPO (POST /repos/<TARGET_REPO>/issues/<n>/labels);
-- one kind of comment: on a backport PR in TARGET_REPO registered with allow_comment
-  (POST /repos/<TARGET_REPO>/issues/<n>/comments);
+- comments on a backport PR in TARGET_REPO registered with allow_comment: the AI conflict summary, or the
+  AI's verdict on CI failures it found unrelated or couldn't fix (POST /repos/<TARGET_REPO>/issues/<n>/comments);
 - creating a view in a project of TARGET_REPO's owner (POST /orgs/<owner>/projectsV2/<n>/views);
 - the GraphQL mutations used to maintain the project; adding an existing issue/PR to the project only for
   content registered with allow_project_content (backport PRs the code has verified are in TARGET_REPO).
@@ -44,7 +44,10 @@ _ALLOWED_COMMENTS: set[int] = set()
 
 
 def allow_comment(pr_number: int) -> None:
-    """Allow commenting on this PR in TARGET_REPO; call only for a backport PR the backporter opened or reuses."""
+    """
+    Allow commenting on this PR in TARGET_REPO; call only for a backport PR the backporter opened or reuses, or an
+    open one in the project on its backport branch (`inspect`).
+    """
     _ALLOWED_COMMENTS.add(pr_number)
 
 

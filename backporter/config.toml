@@ -30,6 +30,19 @@ status = "Needs Review"
 # AI conflict resolution in `backporter run` (`--no-ai` turns it off for one run).
 ai = true
 
+# CMake configure command per version key, used by `backporter inspect` to build an AI fix before pushing it.
+# It runs in <clone dir>/build-<version key> (so `..` is the source), once, before the first `ninja` there.
+# Compilers follow COMPILER_C/COMPILER_CPP in each branch's ci/defs/defs.py.
+[cmake]
+"stable-25.3" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 .."
+"stable-25.8" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 .."
+"stable-26.3" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 .."
+"stable-26.8" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 .."
+"antalya-25.8" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 .."
+"antalya-26.3" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 .."
+"antalya-26.6" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 .."
+"antalya-26.8" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 .."
+
 # Labels added to every backport PR the backporter opens. They must already exist in Altinity/ClickHouse.
 # Per-version labels follow the team's backport PR convention.
 [labels]

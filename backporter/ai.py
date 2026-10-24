@@ -1,5 +1,5 @@
 """
-AI resolution of cherry-pick (backport) and merge (bump) conflicts.
+AI resolution of cherry-pick (backport) and merge (bump) conflicts, and fixes for CI failures of backport PRs.
 
 Backend: the Anthropic API when ANTHROPIC_API_KEY is set, otherwise the `claude` CLI (Claude plan limits).
 The AI works only in the clone dir and reports one outcome; the backporter does all git/GitHub work.
@@ -24,6 +24,10 @@ ALREADY_PRESENT = "ALREADY_PRESENT"
 NOT_APPLICABLE = "NOT_APPLICABLE"
 UNRESOLVED = "UNRESOLVED"
 OUTCOMES = (RESOLVED, ALREADY_PRESENT, NOT_APPLICABLE, UNRESOLVED)
+# CI failures: fixed by edits in the working tree, not caused by the PR, or (UNRESOLVED) needs a human.
+FIXED = "FIXED"
+UNRELATED = "UNRELATED"
+CI_OUTCOMES = (FIXED, UNRELATED, UNRESOLVED)
 
 TIMEOUT_SECONDS = 2 * 3600
 
@@ -148,7 +152,41 @@ SUMMARY:
 """
 
 
-def parse_result(text: str) -> Result:
+def build_ci_prompt(repo_dir: str, branch: str, pr_branch: str, pr_url: str, pr_title: str, subject: str,
+                    source_url: str, merge_base: str, failures: str) -> str:
+    return f"""You are looking at failed CI checks of a ClickHouse backport PR, to fix them if the PR caused them.
+
+Repository: {repo_dir} (your working directory)
+PR: {pr_url} "{pr_title}", the {subject} ({source_url}) into {branch}
+Current branch: {pr_branch}, the PR's head; HEAD is the commit CI ran on
+The PR's changes: `git log --oneline {merge_base}..HEAD` and `git diff {merge_base} HEAD` ({merge_base} is the merge base with {branch})
+
+Failed checks, with excerpts of their reports:
+<ci_failures>
+{failures}
+</ci_failures>
+
+Your job: decide whether each failure is caused by this PR's changes (e.g. code that no longer compiles after the change or its conflict resolution, a test it broke, a test it brought that doesn't fit {branch}), or not (a flaky test, an infrastructure problem, a failure that {branch} has without this PR). Then report exactly one outcome:
+- FIXED: some failures are caused by the PR, and you fixed all of those by editing files in the working tree. Stage each changed file with `git add <path>`. Keep the fix minimal and in the spirit of the PR and of {branch}. The backporter builds the tree and commits and pushes your fix to the PR; if the build fails, you get the errors.
+- UNRELATED: none of the failures is caused by the PR.
+- UNRESOLVED: a failure is caused by the PR, or you can't tell, and you can't fix it with confidence. Explain what blocks you.
+
+Rules:
+- Work only inside {repo_dir}. Don't touch files unrelated to the failures.
+- Do not commit, switch branches, reset, fetch or push. The backporter does that.
+- You can't build or run tests; read the code and the reports.
+- Use one plain command per Bash call, with no pipes, redirections or `&&`.
+- You have no network or GitHub access, so don't try to use them.
+
+End your answer with these lines, exactly:
+OUTCOME: <FIXED|UNRELATED|UNRESOLVED>
+NOTE: <one line: what you fixed, or why the failures are unrelated, or what blocks you>
+SUMMARY:
+<2-5 short Markdown bullet points for reviewers: each failed check, whether the PR caused it and why, and what you changed>
+"""
+
+
+def parse_result(text: str, outcomes: tuple[str, ...] = OUTCOMES) -> Result:
     fields: dict[str, str] = {}
     lines = text.splitlines()
     summary_at = next((i for i, line in enumerate(lines) if re.match(r"^\s*SUMMARY:\s*$", line)), len(lines))
@@ -158,7 +196,7 @@ def parse_result(text: str) -> Result:
             fields[match.group(1)] = match.group(2)
     summary = "\n".join(lines[summary_at + 1:]).strip()
     outcome = fields.get("OUTCOME", "").upper()
-    if outcome not in OUTCOMES:
+    if outcome not in outcomes:
         return Result(UNRESOLVED, "AI did not report an outcome")
     by = fields.get("BY", "")
     try:
@@ -181,21 +219,36 @@ def check_resolved(repo_dir: str, head_before: str, conflicts: list[tuple[str, s
     return None
 
 
-def resolve(repo_dir: str, prompt: str, conflicts: list[tuple[str, str]]) -> Result:
-    head_before = git_ops.run(["git", "rev-parse", "HEAD"], cwd=repo_dir).stdout.strip()
+def _agent(repo_dir: str, prompt: str) -> str:
+    """Run the agent in repo_dir with the edit tools; returns its final text."""
     if os.environ.get("ANTHROPIC_API_KEY"):
         from backporter import ai_api
 
-        print("AI: resolving with the Anthropic API...")
-        text = ai_api.run_agent(repo_dir, prompt, os.environ["ANTHROPIC_API_KEY"], locked_env())
-    else:
-        print("AI: resolving with the claude CLI...")
-        text = _run_cli(repo_dir, prompt, _resolve_tools())
-    result = parse_result(text)
+        print("AI: working with the Anthropic API...")
+        return ai_api.run_agent(repo_dir, prompt, os.environ["ANTHROPIC_API_KEY"], locked_env())
+    print("AI: working with the claude CLI...")
+    return _run_cli(repo_dir, prompt, _resolve_tools())
+
+
+def resolve(repo_dir: str, prompt: str, conflicts: list[tuple[str, str]]) -> Result:
+    head_before = git_ops.head_sha(repo_dir)
+    result = parse_result(_agent(repo_dir, prompt))
     if result.outcome == RESOLVED:
         problem = check_resolved(repo_dir, head_before, conflicts)
         if problem:
             return Result(UNRESOLVED, f"AI reported resolved, but {problem}")
+    print(f"AI: {result.outcome}: {result.note}")
+    return result
+
+
+def fix_ci(repo_dir: str, prompt: str) -> Result:
+    """Let the AI judge CI failures (see build_ci_prompt) and fix them in the working tree."""
+    head_before = git_ops.head_sha(repo_dir)
+    result = parse_result(_agent(repo_dir, prompt), CI_OUTCOMES)
+    if result.outcome == FIXED:
+        problem = check_resolved(repo_dir, head_before, [])
+        if problem:
+            return Result(UNRESOLVED, f"AI reported fixed, but {problem}")
     print(f"AI: {result.outcome}: {result.note}")
     return result
 

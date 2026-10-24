@@ -388,6 +388,37 @@ def redo(repo_dir: str, command: list[str]) -> list[tuple[str, str]]:
     return get_conflicted_entries(repo_dir)
 
 
+def checkout_pr_branch(repo_dir: str, target_repo: str, target_branch: str, branch: str, sha: str) -> str:
+    """
+    Check out branch at sha, which must be its head on origin (asking before resetting a local branch that differs).
+    Refuses if the clone has local changes. Returns the merge base with target_branch.
+    """
+    check_repo_dir(repo_dir)
+    check_origin(repo_dir, target_repo)
+    dirty = run(["git", "status", "--porcelain", "--untracked-files=no", "--ignore-submodules"], cwd=repo_dir).stdout
+    if dirty.strip() or is_cherry_pick_in_progress(repo_dir) or is_merge_in_progress(repo_dir):
+        raise RuntimeError(f"{repo_dir} has local changes or a cherry-pick/merge in progress; clean it first")
+    run(
+        ["git", "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+         f"+refs/heads/{target_branch}:refs/remotes/origin/{target_branch}"],
+        cwd=repo_dir, stream=True,
+    )
+    remote = run(["git", "rev-parse", f"refs/remotes/origin/{branch}"], cwd=repo_dir).stdout.strip()
+    if remote != sha:
+        raise RuntimeError(f"origin/{branch} is at {remote[:12]}, not at the PR's head {sha[:12]}")
+    if branch_exists(repo_dir, branch):
+        local = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo_dir).stdout.strip()
+        if local != sha and not prompt_yes_no(f"Local branch '{branch}' differs from origin. Reset it to origin?"):
+            raise RuntimeError("Aborted")
+    run(["git", "checkout", "-B", branch, sha], cwd=repo_dir)
+    return run(["git", "merge-base", f"refs/remotes/origin/{target_branch}", "HEAD"], cwd=repo_dir).stdout.strip()
+
+
+def discard_changes(repo_dir: str) -> None:
+    """Drop uncommitted changes to tracked files."""
+    run(["git", "reset", "-q", "--hard", "HEAD"], cwd=repo_dir)
+
+
 def push(repo_dir: str, branch: str, target_repo: str) -> None:
     check_origin(repo_dir, target_repo)
     print(f"Pushing {branch} to {target_repo}...")

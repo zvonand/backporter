@@ -1,5 +1,5 @@
 """
-Conflict-resolution agent on the Anthropic API, with locally executed, restricted tools.
+Agent on the Anthropic API (conflict resolution, CI fixes), with locally executed, restricted tools.
 
 Bash runs a single command without a shell, and only allowlisted commands (see ai.GIT_SUBCOMMANDS,
 ai.OTHER_COMMANDS). File tools are confined to the repo dir.
@@ -19,8 +19,8 @@ MAX_TURNS = 200
 OUTPUT_LIMIT = 30000
 
 SYSTEM = (
-    "You are an autonomous, headless agent resolving a git conflict. Never ask for confirmation. "
-    "Follow the task's output contract exactly: end with the OUTCOME/NOTE/BY lines."
+    "You are an autonomous, headless agent working in a git repository. Never ask for confirmation. "
+    "Follow the task's output contract exactly: end with the lines it asks for."
 )
 
 TOOLS = [

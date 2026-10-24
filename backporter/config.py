@@ -20,6 +20,9 @@ ENV_PATHS = (".env", os.path.join(os.path.dirname(os.path.dirname(os.path.abspat
 # The only repo the backporter pushes branches to and opens PRs in.
 TARGET_REPO = "Altinity/ClickHouse"
 
+# Praktika CI report of one job of a TARGET_REPO PR at a commit (gzipped JSON); job is the normalized check name.
+CI_REPORT_URL = "https://altinity-build-artifacts.s3.amazonaws.com/PRs/{pr}/{sha}/result_{job}.json"
+
 FLAVORS = ("stable", "antalya")
 _KEY_RE = re.compile(r"^(stable|antalya)-(\d+)\.(\d+)$")
 
@@ -80,6 +83,8 @@ class Config:
     run_ai: bool
     # flavor -> builds project
     builds: dict[str, Build]
+    # version key -> cmake configure command (`backporter inspect`)
+    cmake: dict[str, str]
 
     def labels_for(self, version: Version) -> list[str]:
         """Labels for a backport PR into version: 'all', then its flavor's, then its own."""
@@ -124,7 +129,14 @@ def load_config(path: str = CONFIG_PATH) -> Config:
         if flavor not in FLAVORS or not isinstance(b.get("project"), int) or not b.get("version_field"):
             raise ValueError(f"{path}: builds.{flavor} needs a flavor key, an integer project and a version_field")
         builds[flavor] = Build(b["project"], b["version_field"], b.get("status", ""))
-    return Config(data.get("project_owner", ""), data.get("project_number", 0), labels, branches, run_ai, builds)
+    cmake = data.get("cmake", {})
+    for key, command in cmake.items():
+        Version.parse(key, "")
+        if not isinstance(command, str) or not command:
+            raise ValueError(f"{path}: cmake.{key} must be a command")
+    return Config(
+        data.get("project_owner", ""), data.get("project_number", 0), labels, branches, run_ai, builds, cmake,
+    )
 
 
 def save_project(owner: str, number: int, path: str = CONFIG_PATH) -> None:

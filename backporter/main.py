@@ -10,6 +10,7 @@ Backport tracker backed by a GitHub Project.
     backporter run [--no-ai]                  scan, then backport everything with Decision Approved
     backporter continue <PR-URL> <version>    finish after resolving conflicts (--ai: let AI resolve them)
     backporter mark <PR-URL> <version> present|not-applicable [--by URL] [--note TEXT]
+    backporter inspect [--version KEY]        AI checks failed CI of open backport PRs, pushes fixes that build
     backporter describe <PR-URL>              print a PR's changelog category and entry (as in backport PRs)
 
 Instead of a <PR-URL>, add/remove/start/continue/mark also take an upstream release URL, e.g.
@@ -29,7 +30,7 @@ from github import Github, GithubException
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
-from backporter import ai, git_ops, github_guard, pr_body
+from backporter import ai, ci, git_ops, github_guard, pr_body
 from backporter.github_guard import guarded_github
 from backporter.config import (
     CONFIG_PATH, FLAVORS, TARGET_REPO, Config, Version, find_version, load_config, load_dirs, load_dotenv,
@@ -43,6 +44,8 @@ from backporter.rules import closure, plan_remove, sort_versions
 
 
 _VERSION_KEY_RE = re.compile(r"\b(?:stable|antalya)-\d+\.\d+\b")
+# AI attempts at a CI fix that builds, in `inspect`.
+BUILD_ATTEMPTS = 3
 
 
 def source_url(pr_repo: str, number: int) -> str:
@@ -892,6 +895,127 @@ def cmd_continue(args, gh: Github, config: Config) -> None:
         sys.exit(1)
 
 
+def ci_comment(sha: str, failures: list[ci.Failure], verdict: str, result: ai.Result) -> str:
+    """Comment for a backport (or bump) PR whose CI failures the AI found unrelated or couldn't fix."""
+    checks = "\n".join(f"- [{f.check}]({f.url})" for f in failures)
+    return (
+        f"**Backporter: CI failures at {sha[:12]}**\n\n"
+        f"Failed checks:\n{checks}\n\n"
+        f"{verdict}: {result.note}\n\n"
+        f"{result.summary}\n"
+    )
+
+
+def inspect_pr(gh: Github, project: Project, config: Config, item: Item, version: Version, repo_dir: str) -> bool:
+    """
+    Look at the failed CI checks of an item's open backport (or bump) PR. The AI decides whether the PR caused them
+    and fixes them; a fix that builds is committed and pushed to the PR's branch. The outcome goes to Note, marked
+    with the inspected commit so it isn't inspected again; unrelated or unfixed failures also get a PR comment.
+    False if a human is needed.
+    """
+    repo = gh.get_repo(TARGET_REPO)
+    pr = repo.get_pull(git_ops.parse_pr_url(item.backport_pr)[1])
+    branch = backport_branch(version, item.source_pr)
+    if pr.state != "open":
+        print(f"{pr.html_url} is {'merged' if pr.merged else pr.state}; skipped (`backporter scan` updates it)")
+        return True
+    if not pr.head.repo or pr.head.repo.full_name.lower() != TARGET_REPO.lower() or pr.head.ref != branch:
+        print(f"{pr.html_url}: head is not {TARGET_REPO}:{branch}; skipped")
+        return True
+    sha = pr.head.sha
+    marker = f"CI at {sha[:12]}:"
+    if item.note.startswith(marker):
+        print(f"Already inspected: {item.note}")
+        return True
+    failures = ci.failures(repo, pr.number, sha)
+    if failures is None:
+        print(f"CI hasn't finished on {sha[:12]}; skipped")
+        return True
+    if not failures:
+        print(f"No failed checks on {sha[:12]}")
+        return True
+    checks = ", ".join(f.check for f in failures)
+    print(f"Failed checks on {sha[:12]}: {checks}")
+    source = load_source(gh, item.source_pr)
+    merge_base = git_ops.checkout_pr_branch(repo_dir, TARGET_REPO, version.branch, branch, sha)
+    try:
+        ci.update_submodules(repo_dir)
+        details = "\n\n".join(f"### {f.check} ({f.url})\n{f.details}" for f in failures)
+        prompt = ai.build_ci_prompt(
+            repo_dir, version.branch, branch, pr.html_url, pr.title, source.subject, source.url, merge_base, details,
+        )
+        build_dir = os.path.join(repo_dir, f"build-{version.key}")
+        for attempt in range(1, BUILD_ATTEMPTS + 1):
+            result = ai.fix_ci(repo_dir, prompt)
+            if result.outcome != ai.FIXED:
+                break
+            if git_ops.index_matches_head(repo_dir):
+                result = ai.Result(ai.UNRESOLVED, "AI reported fixed, but changed nothing")
+                break
+            errors = ci.build(repo_dir, build_dir, config.cmake[version.key])
+            if errors is None:
+                break
+            result = ai.Result(
+                ai.UNRESOLVED, f"the AI's fix doesn't build after {attempt} attempt(s)",
+                summary=f"Build errors of the last attempt:\n```\n{errors}\n```",
+            )
+            prompt += (
+                f"\n\nYour previous fix is in the working tree (`git diff HEAD`), but it doesn't build:\n"
+                f"<build_errors>\n{errors}\n</build_errors>\nFix the build, then report the outcome again."
+            )
+        if result.outcome == ai.FIXED:
+            fix_sha = git_ops.commit_resolution(repo_dir, f"Fix CI failures ({checks})\n\n{result.note}\n")
+            git_ops.push(repo_dir, branch, TARGET_REPO)
+            project.set_value(item.id, F_NOTE, f"{marker} AI fixed it in {fix_sha[:12]}: {result.note}")
+            print(f"{version.key}: pushed the fix {fix_sha[:12]} to {pr.html_url}")
+            return True
+        if result.outcome == ai.UNRELATED:
+            verdict, note = "Unrelated to this PR", f"{marker} unrelated: {result.note}"
+        else:
+            verdict, note = "Needs a human", f"{marker} needs a human: {result.note}"
+        github_guard.allow_comment(pr.number)
+        pr.create_issue_comment(ci_comment(sha, failures, verdict, result))
+        project.set_value(item.id, F_NOTE, note)
+        print(f"{version.key}: {note}")
+        return result.outcome == ai.UNRELATED
+    finally:
+        git_ops.discard_changes(repo_dir)
+        git_ops.drop_backport_branch(repo_dir, version.branch, branch)
+
+
+def cmd_inspect(args, gh: Github, config: Config) -> None:
+    """Inspect the failed CI of every open backport (and bump) PR in the project that has a clone dir."""
+    project = open_project(gh, config)
+    versions = project_versions(project, config)
+    if args.version:
+        find_version(versions, args.version)
+    dirs = load_dirs(args.dirs, versions)
+    if reason := ai.unavailable():
+        raise RuntimeError(reason)
+    items = [
+        i for i in tracked_items(project)
+        if i.status == PR_OPEN and i.backport_pr and i.decision != DISCARDED
+        and (not args.version or i.version == args.version)
+    ]
+    if not items:
+        print("No open backport PRs.")
+        return
+    failed = False
+    for n, item in enumerate(items, 1):
+        print(f"\n##### [{n}/{len(items)}] {item.version} {item.backport_pr}")
+        if item.version not in dirs or item.version not in config.cmake:
+            print(f"No clone dir or no [cmake] entry for {item.version}; skipped", file=sys.stderr)
+            continue
+        try:
+            if not inspect_pr(gh, project, config, item, find_version(versions, item.version), dirs[item.version]):
+                failed = True
+        except (RuntimeError, ValueError, GithubException, OSError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            failed = True
+    if failed:
+        sys.exit(1)
+
+
 def cmd_mark(args, gh: Github, config: Config) -> None:
     url = parse_source(args.pr)
     project = open_project(gh, config)
@@ -1003,6 +1127,13 @@ def main() -> None:
     p.add_argument("--by", help="URL of the PR that already brought the change (present)")
     p.add_argument("--note", help="Reason, stored in the project's Note field (required for not-applicable)")
     p.set_defaults(func=cmd_mark)
+
+    p = sub.add_parser(
+        "inspect", parents=[with_dirs],
+        help="Let AI check the failed CI of open backport PRs; fixes that build are pushed to the PR",
+    )
+    p.add_argument("--version", help="Only this version key")
+    p.set_defaults(func=cmd_inspect)
 
     p = sub.add_parser("describe", parents=[common], help="Print changelog description of a PR")
     p.add_argument("pr", help="PR URL")
