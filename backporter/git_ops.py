@@ -277,9 +277,9 @@ def merge_tag(
 
 
 def index_matches_head(repo_dir: str) -> bool:
-    """True if neither the index nor the working tree differ from HEAD (tracked files)."""
+    """True if neither the index nor the working tree differ from HEAD (tracked files; submodule work trees ignored)."""
     staged = run_no_check(["git", "diff", "--cached", "--quiet", "HEAD"], cwd=repo_dir).returncode
-    unstaged = run_no_check(["git", "diff", "--quiet"], cwd=repo_dir).returncode
+    unstaged = run_no_check(["git", "diff", "--quiet", "--ignore-submodules"], cwd=repo_dir).returncode
     return staged == 0 and unstaged == 0
 
 
