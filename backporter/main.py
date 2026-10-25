@@ -54,6 +54,9 @@ BUILD_ATTEMPTS = 3
 SOURCES_PER_READ = 50
 # Note prefix of items `check` has tried; later checks skip them.
 CHECKED = "Checked:"
+# Source PR diff size and revert chain length given to the AI that fills a PR body.
+MAX_DIFF_CHARS = 100_000
+MAX_REVERT_DEPTH = 20
 # Set in the re-run that run_logged() makes.
 _LOGGED_ENV = "BACKPORTER_LOGGED"
 
@@ -312,6 +315,38 @@ def read_template(repo: Repository) -> str:
         )
 
 
+def source_diff(pr: PullRequest) -> str:
+    """The PR's changed files and their patches, cut at MAX_DIFF_CHARS."""
+    files = list(pr.get_files())
+    names = "\n".join(f"{f.status}: {f.filename}" for f in files)
+    patches = "\n".join(f"--- {f.filename}\n{f.patch or '(no patch)'}" for f in files)
+    if len(patches) > MAX_DIFF_CHARS:
+        patches = patches[:MAX_DIFF_CHARS] + "\n[diff truncated]"
+    return f"{names}\n\n{patches}"
+
+
+def reverted_prs(pr: PullRequest) -> str:
+    """
+    Title and body of the PRs reverted by pr ("Reverts <repo>#N" or "Reverts <PR URL>" in its body), following
+    reverts of reverts, each with whether pr undoes its change (odd number of reverts away) or re-applies it (even).
+    """
+    repo = pr.base.repo
+    name = re.escape(repo.full_name)
+    reverts = re.compile(rf"^Reverts (?:{name}#|https://github\.com/{name}/pull/)(\d+)", re.MULTILINE | re.IGNORECASE)
+    parts = []
+    for depth in range(1, MAX_REVERT_DEPTH + 1):
+        match = reverts.search(pr.body or "")
+        if not match:
+            break
+        pr = repo.get_pull(int(match.group(1)))
+        effect = "undoes" if depth % 2 else "re-applies"
+        parts.append(f"{depth} revert(s) away, so the source PR {effect} it: {pr.html_url}: {pr.title}\n{pr.body or ''}")
+    else:
+        if reverts.search(pr.body or ""):
+            parts.append(f"(chain cut after {MAX_REVERT_DEPTH} reverts)")
+    return "\n\n".join(parts)
+
+
 def backport_body(repo: Repository, pr: PullRequest) -> str:
     """
     The PR template of repo's current default branch with the source PR's changelog category and entry
@@ -321,11 +356,15 @@ def backport_body(repo: Repository, pr: PullRequest) -> str:
     if not pr.user:
         raise pr_body.Unclear("the source PR has no author")
     template = read_template(repo)
+    labels = [label.name for label in pr.labels]
     try:
-        return pr_body.build(template, pr.body or "", pr.html_url, pr.user.login)
+        return pr_body.build(template, pr.body or "", pr.html_url, pr.user.login, labels)
     except pr_body.Unclear as e:
         print(f"PR body: {e}; asking the AI...")
-        prompt = pr_body.prompt(template, pr.body or "", pr.html_url, pr.user.login, pr.title, str(e))
+        prompt = pr_body.prompt(
+            template, pr.body or "", pr.html_url, pr.user.login, pr.title, labels, str(e),
+            source_diff(pr), reverted_prs(pr),
+        )
         try:
             answer = ai.complete(prompt)
         except RuntimeError as ai_error:
