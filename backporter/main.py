@@ -93,11 +93,16 @@ def bump_number(tag: str) -> str:
 
 @dataclass
 class Source:
-    """What goes into a version: a merged PR (cherry-picked) or an upstream release (its tag merged: a bump)."""
+    """
+    What goes into a version: a PR (cherry-picked) or an upstream release (its tag merged: a bump).
+    An unmerged PR goes only into Antalya versions.
+    """
     url: str
     repo: str
     pr: PullRequest | None = None
     tag: str = ""
+    # The commit a PR's cherry-pick picks with -m 1 (set by prepare).
+    sha: str = ""
 
     @property
     def title(self) -> str:
@@ -115,7 +120,20 @@ class Source:
     @property
     def command(self) -> list[str]:
         """The git command that brings the source into a branch."""
-        return git_ops.merge_command(self.tag) if self.tag else git_ops.pick_command(self.pr.merge_commit_sha)
+        return git_ops.merge_command(self.tag) if self.tag else git_ops.pick_command(self.sha)
+
+    def prepare(self, version: Version, repo_dir: str) -> str:
+        """
+        The ref that brings the source into version: the tag; the PR's merge commit; or, for an unmerged PR and an
+        Antalya version, a commit with the PR's diff, made in repo_dir (see git_ops.pr_diff_commit).
+        """
+        if self.tag:
+            return self.tag
+        if not self.pr.merged and version.flavor == "antalya":
+            self.sha = git_ops.pr_diff_commit(repo_dir, TARGET_REPO, self.repo, self.pr)
+        else:
+            self.sha = git_ops.get_merge_commit_sha(self.pr)
+        return self.sha
 
     def pr_title(self, version: Version) -> str:
         """Title of the backport (or bump) PR into version."""
@@ -784,7 +802,7 @@ def ai_resolution(
     else:
         pr = source.pr
         prompt = ai.build_prompt(
-            repo_dir, version.branch, branch, pr.html_url, pr.title, pr.body or "", pr.merge_commit_sha, conflicts,
+            repo_dir, version.branch, branch, pr.html_url, pr.title, pr.body or "", source.sha, conflicts,
             conflict_sha,
         )
     result = ai.resolve(repo_dir, prompt, conflicts)
@@ -866,7 +884,6 @@ def backport(
     By default it stops there, leaving the conflicts in progress for `continue`. With keep_clone_clean (for `run`,
     where clones are shared) it drops that attempt, notes how to redo it by hand, and goes on with the next version.
     """
-    ref = source.tag or git_ops.get_merge_commit_sha(source.pr, all(v.flavor == "antalya" for v in targets))
     apply = git_ops.merge_tag if source.tag else git_ops.cherry_pick
     for v in targets:
         git_ops.check_repo_dir(dirs[v.key])
@@ -887,6 +904,7 @@ def backport(
             if not finish_backport(gh, project, config, item, v, source, dirs[v.key], comment):
                 ok = False
             continue
+        ref = source.prepare(v, dirs[v.key])
         outcome, conflicts = apply(dirs[v.key], TARGET_REPO, v.branch, branch, source.repo, ref, replace)
         if outcome == git_ops.EMPTY:
             record_present(gh, project, item, v, source, dirs[v.key])
@@ -1001,7 +1019,7 @@ def check_version(
     """
     branch = backport_branch(version, source.url)
     apply = git_ops.merge_tag if source.tag else git_ops.cherry_pick
-    ref = source.tag or git_ops.get_merge_commit_sha(source.pr, version.flavor == "antalya")
+    ref = source.prepare(version, repo_dir)
     outcome, conflicts = apply(repo_dir, TARGET_REPO, version.branch, branch, source.repo, ref, True)
     if outcome == git_ops.EMPTY:
         record_present(gh, project, item, version, source, repo_dir)
@@ -1117,6 +1135,8 @@ def cmd_continue(args, gh: Github, config: Config) -> None:
             raise RuntimeError(f"{repo_dir} is not on {branch}")
         conflicts = git_ops.get_conflicted_entries(repo_dir)
         if conflicts:
+            if not source.tag:
+                source.sha = git_ops.cherry_pick_head(repo_dir)
             if not resolve_with_ai(gh, project, config, item, version, source, repo_dir, conflicts):
                 sys.exit(1)
             return

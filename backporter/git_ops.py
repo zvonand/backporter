@@ -162,20 +162,8 @@ def release_number(tag: str) -> tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
-def get_merge_commit_sha(pr: PullRequest, unmerged_ok: bool = False) -> str:
-    """
-    Return the merge commit SHA of a merged PR. With unmerged_ok, an open PR gives its test merge commit
-    (GitHub's merge of the PR into its base branch); its first parent is the base, as for a merge commit.
-    """
-    if not pr.merged and unmerged_ok:
-        if pr.state != "open":
-            raise RuntimeError(f"PR #{pr.number} is closed without being merged")
-        if not pr.mergeable or not pr.merge_commit_sha:
-            raise RuntimeError(
-                f"PR #{pr.number} has no test merge commit (it conflicts with its base branch, or GitHub "
-                f"hasn't checked yet; retry later)"
-            )
-        return pr.merge_commit_sha
+def get_merge_commit_sha(pr: PullRequest) -> str:
+    """Return the merge commit SHA of a merged PR."""
     if not pr.merged:
         raise RuntimeError(f"PR #{pr.number} is not merged yet")
     if not pr.merge_commit_sha:
@@ -276,7 +264,8 @@ def cherry_pick(
     target_branch. On CONFLICTS the cherry-pick is left in progress for resolving.
     """
     _start_branch(repo_dir, target_repo, target_branch, backport_branch, replace)
-    _fetch_source(repo_dir, target_repo, pr_repo, merge_sha)
+    if not commit_exists(repo_dir, merge_sha):
+        _fetch_source(repo_dir, target_repo, pr_repo, merge_sha)
 
     print("Cherry-picking merge commit...")
     cmd = pick_command(merge_sha)
@@ -286,6 +275,34 @@ def cherry_pick(
     if not get_conflicted_entries(repo_dir) and is_cherry_pick_in_progress(repo_dir) and index_matches_head(repo_dir):
         return EMPTY, []
     return CONFLICTS, _conflicts_or_fail(repo_dir, cp_result, cmd)
+
+
+def pr_diff_commit(repo_dir: str, target_repo: str, pr_repo: str, pr: PullRequest) -> str:
+    """
+    Make a commit in repo_dir whose diff is pr's change, as GitHub shows it: the tree of the PR's head on top of
+    its merge base with the base branch, authored by the head's author. For an unmerged (open or closed) PR,
+    whose change has no merge commit; it is cherry-picked like one.
+    """
+    head, base = f"refs/backporter/pull/{pr.number}/head", f"refs/backporter/pull/{pr.number}/base"
+    print(f"Fetching the head and base branch of unmerged PR #{pr.number}...")
+    _fetch_source(
+        repo_dir, target_repo, pr_repo, "--no-tags",
+        f"+refs/pull/{pr.number}/head:{head}", f"+refs/heads/{pr.base.ref}:{base}",
+    )
+    merge_base = run(["git", "merge-base", base, head], cwd=repo_dir).stdout.strip()
+    name, email, date = run(
+        ["git", "log", "-1", "--format=%an%n%ae%n%ad", "--date=raw", head], cwd=repo_dir
+    ).stdout.splitlines()
+    head_sha = run(["git", "rev-parse", head], cwd=repo_dir).stdout.strip()
+    message = f"{pr.title} ({pr_repo}#{pr.number})\n\nChanges of unmerged {pr.html_url} at {head_sha}\n"
+    env = {**os.environ, "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_DATE": date}
+    result = subprocess.run(
+        ["git", "commit-tree", f"{head}^{{tree}}", "-p", merge_base, "-F", "-"],
+        cwd=repo_dir, input=message, capture_output=True, text=True, env=env,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git commit-tree failed: {result.stderr.strip()}")
+    return result.stdout.strip()
 
 
 def merge_tag(
@@ -341,6 +358,15 @@ def checked_comment(repo_dir: str, branch: str) -> str | None:
         return None
     result = run_no_check(["git", "config", "--get", f"branch.{branch}.{_CHECKED_KEY}"], cwd=repo_dir)
     return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
+def commit_exists(repo_dir: str, sha: str) -> bool:
+    return run_no_check(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=repo_dir).returncode == 0
+
+
+def cherry_pick_head(repo_dir: str) -> str:
+    """The commit being cherry-picked by the in-progress cherry-pick."""
+    return run(["git", "rev-parse", "CHERRY_PICK_HEAD"], cwd=repo_dir).stdout.strip()
 
 
 def is_ancestor(repo_dir: str, commit: str, ref: str) -> bool:

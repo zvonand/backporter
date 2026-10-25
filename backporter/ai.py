@@ -84,7 +84,7 @@ def build_prompt(repo_dir: str, branch: str, backport_branch: str, pr_url: str, 
 Repository: {repo_dir} (your working directory)
 Target branch: {branch} (an older ClickHouse release line)
 Current branch: {backport_branch}, created from {branch}
-Being cherry-picked: merge commit {merge_sha} of {pr_url}
+Being cherry-picked: {merge_sha}, the change of {pr_url} (its merge commit, or for an unmerged PR a commit with the PR's diff)
 Source PR title: {pr_title}
 
 Source PR description:

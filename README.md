@@ -13,7 +13,7 @@ Name only the **oldest** version that needs the change. The newer ones are added
 
 Version keys look like `stable-25.8` or `antalya-26.3`. Each version has its own view (tab) in the project, named by its key.
 
-**Unmerged PRs.** A PR can be requested before it's merged, and its Antalya versions can be backported before then too. Stable versions wait until it's merged: until then `start`, `run` and `check` skip them. While the PR is open, the change is taken from GitHub's test merge commit (the PR merged into its base branch). So the PR must be open and mergeable into its base; a PR closed without merging can't be backported.
+**Unmerged PRs.** A PR can be requested before it's merged, and its Antalya versions can be backported before then too. Stable versions wait until it's merged: until then `start`, `run` and `check` skip them. An unmerged PR, open or closed, is backported as its diff, the same one GitHub shows under "Files changed", even if it conflicts with its base branch.
 
 ### From the project's web page (nothing to install)
 
@@ -311,7 +311,8 @@ Backports a PR (or, given a release URL, does a bump) right away. An unmerged PR
 
 1. Fetches and checks out the target branch and pulls it.
 2. Creates `backports/<branch>/<N>`.
-3. Cherry-picks the PR's merge commit with `-m 1` (for an unmerged PR: its test merge commit, which GitHub makes while the PR is open and mergeable). If the PR is not from `Altinity/ClickHouse`, the commit is fetched from an `upstream` remote, which is added or updated automatically.
+3. Cherry-picks the PR's merge commit with `-m 1`. If the PR is not from `Altinity/ClickHouse`, the commit is fetched from an `upstream` remote, which is added or updated automatically.
+   For an unmerged PR, it first fetches the PR's head (`refs/pull/<N>/head`) and its base branch into `refs/backporter/pull/<N>/head` and `.../base`. It then makes a local commit with the head's tree on top of their merge base, authored by the head commit's author, so the commit's diff is the PR's diff. That commit is what gets cherry-picked.
    For a bump, the branch is `bump/<branch>/<X.Y.Z>` and this step fetches only the release's tag from `upstream` and runs `git merge --no-ff <tag>`.
 4. Pushes the branch to `origin`.
 5. Opens a PR into the target branch titled `<Stable|Antalya> X.Y Backport of #N - <exact source PR title>`, with the labels configured for its version (see Configuration). If an open PR already exists for the branch, it is reused. The body is built before anything is pushed (see [PR body](#pr-body)).
