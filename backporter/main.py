@@ -213,10 +213,16 @@ def promote(project: Project, item: Item, backport: PullRequest) -> None:
 
 
 _builds_projects: dict[int, Project] = {}
+F_PRIORITY = "Priority"
+_COPIED_TYPES = ("TEXT", "SINGLE_SELECT", "NUMBER", "DATE")
+_NUMBER_RE = re.compile(r"\d+\.\d+")
 
 
-def sync_builds(gh: Github, config: Config, version: Version, backport: PullRequest) -> None:
-    """Add the backport PR to its flavor's builds project once, with the version number (see [builds])."""
+def sync_builds(gh: Github, config: Config, version: Version, backport: PullRequest, source: str) -> None:
+    """
+    Add the backport PR to its flavor's builds project once, with the version number (see [builds]). The source
+    PR's row there for this version passes its values to the new row and loses the version (deleted if none is left).
+    """
     build = config.builds.get(version.flavor)
     if not build or (backport.state == "closed" and not backport.merged_at):
         return
@@ -234,13 +240,36 @@ def sync_builds(gh: Github, config: Config, version: Version, backport: PullRequ
     if project.fields.get(build.version_field, {}).get("dataType") != "TEXT":
         print(f"Builds project {build.project} has no text field '{build.version_field}'; not added", file=sys.stderr)
         return
+    number = f"{version.version[0]}.{version.version[1]}"
+    old = None
+    if not is_bump(source):
+        rows = project.items(f"repo:{git_ops.parse_pr_url(source)[0]}")
+        old = next((
+            i for i in rows
+            if i.content_url == source and number in _NUMBER_RE.findall(i.values.get(build.version_field, ""))
+        ), None)
+    values = {
+        name: value for name, value in (old.values if old else {}).items()
+        if project.fields.get(name, {}).get("dataType") in _COPIED_TYPES and name not in (F_STATUS, build.version_field)
+    }
+    if build.priority:
+        values.setdefault(F_PRIORITY, build.priority)
+    values[build.version_field] = number
+    if build.status and not backport.merged_at:
+        values[F_STATUS] = build.status
     github_guard.allow_project_content(backport.node_id)
     item_id = project.add_existing_item(backport.node_id)
-    number = f"{version.version[0]}.{version.version[1]}"
-    project.set_value(item_id, build.version_field, number)
-    if build.status and not backport.merged_at:
-        project.set_value(item_id, F_STATUS, build.status)
+    for name, value in values.items():
+        project.set_value(item_id, name, value)
     print(f"    added {backport.html_url} to project {build.project} ({build.version_field} = {number})")
+    if old:
+        rest = [n for n in _NUMBER_RE.findall(old.values[build.version_field]) if n != number]
+        if rest:
+            project.set_value(old.id, build.version_field, ", ".join(rest))
+            print(f"    {source} in project {build.project}: {build.version_field} = {', '.join(rest)}")
+        else:
+            project.delete_item(old.id)
+            print(f"    removed {source} from project {build.project}")
 
 
 def version_number(number: str) -> tuple[int, int]:
@@ -551,7 +580,7 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
             continue
         status = MERGED if pr.merged_at else CLOSED if pr.state == "closed" else PR_OPEN
         promote(project, item, pr)
-        sync_builds(gh, config, version, pr)
+        sync_builds(gh, config, version, pr, item.source_pr)
         if pr.html_url != item.backport_pr:
             project.set_value(item.id, F_BACKPORT_PR, pr.html_url)
             item.backport_pr = pr.html_url
@@ -636,7 +665,7 @@ def finish_backport(
         backport.create_issue_comment(comment)
     print("Updating the project...")
     promote(project, item, backport)
-    sync_builds(gh, config, version, backport)
+    sync_builds(gh, config, version, backport, source.url)
     project.set_value(item.id, F_BACKPORT_PR, backport.html_url)
     project.set_value(item.id, F_STATUS, PR_OPEN)
     print(f"{version.key}: {backport.html_url}")

@@ -69,6 +69,8 @@ class Build:
     version_field: str
     # Status for a newly added open PR; empty = leave unset
     status: str
+    # Priority for a newly added PR whose source PR's row has none; empty = leave unset
+    priority: str
 
 
 @dataclass
@@ -128,7 +130,7 @@ def load_config(path: str = CONFIG_PATH) -> Config:
     for flavor, b in data.get("builds", {}).items():
         if flavor not in FLAVORS or not isinstance(b.get("project"), int) or not b.get("version_field"):
             raise ValueError(f"{path}: builds.{flavor} needs a flavor key, an integer project and a version_field")
-        builds[flavor] = Build(b["project"], b["version_field"], b.get("status", ""))
+        builds[flavor] = Build(b["project"], b["version_field"], b.get("status", ""), b.get("priority", ""))
     cmake = data.get("cmake", {})
     for key, command in cmake.items():
         Version.parse(key, "")

@@ -8,7 +8,7 @@ Versions are the options of the Version field; their branches come from the conf
 
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from github.Requester import Requester
 
@@ -105,10 +105,12 @@ query($id: ID!, $after: String, $query: String) {
             ... on DraftIssue { title body }
             ... on PullRequest { title url }
           }
-          fieldValues(first: 20) {
+          fieldValues(first: 50) {
             nodes {
               ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2FieldCommon { name } } }
               ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } }
+              ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2FieldCommon { name } } }
+              ... on ProjectV2ItemFieldDateValue { date field { ... on ProjectV2FieldCommon { name } } }
             }
           }
         }
@@ -137,6 +139,8 @@ class Item:
     not_needed_from: str
     # Who added the item to the project
     creator: str
+    # Every text, single select, number and date value, by field name
+    values: dict[str, str] = field(default_factory=dict)
 
 
 # Tracked rows only: unprocessed requests (no Requested value yet) belong in the Requests view.
@@ -421,7 +425,9 @@ class Project:
                 values = {}
                 for fv in node["fieldValues"]["nodes"]:
                     if fv and fv.get("field"):
-                        values[fv["field"]["name"]] = fv.get("text", fv.get("name"))
+                        values[fv["field"]["name"]] = (
+                            str(fv["number"]) if "number" in fv else fv.get("text", fv.get("name", fv.get("date")))
+                        )
                 content = node.get("content") or {}
                 result.append(Item(
                     id=node["id"],
@@ -439,6 +445,7 @@ class Project:
                     requested_by=values.get(F_REQUESTED_BY, ""),
                     not_needed_from=values.get(F_NOT_NEEDED_FROM, ""),
                     creator=(node.get("creator") or {}).get("login", ""),
+                    values=values,
                 ))
             if not page["pageInfo"]["hasNextPage"]:
                 return result
@@ -470,6 +477,10 @@ class Project:
             if option is None:
                 raise RuntimeError(f"Field '{field_name}' has no option '{value}'")
             v = {"singleSelectOptionId": option["id"]}
+        elif field["dataType"] == "NUMBER":
+            v = {"number": float(value)}
+        elif field["dataType"] == "DATE":
+            v = {"date": value}
         else:
             v = {"text": value}
         self.requester.graphql_named_mutation(
