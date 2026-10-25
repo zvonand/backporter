@@ -14,6 +14,8 @@ else:
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.toml")
 DIRS_PATH = os.path.expanduser("~/.config/backporter/dirs.toml")
+# Everything the last run printed (overwritten by each run).
+LOG_PATH = os.path.expanduser("~/.local/state/backporter/last-run.log")
 # .env in the current directory, then in the repo root (editable install).
 ENV_PATHS = (".env", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 

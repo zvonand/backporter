@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import urllib.error
 import urllib.request
@@ -98,9 +99,51 @@ def failures(repo: Repository, pr_number: int, sha: str) -> list[Failure] | None
 
 
 def update_submodules(repo_dir: str) -> None:
+    """
+    Check out every submodule at its recorded commit, dropping local changes in them. Submodules that still
+    aren't there (e.g. their source changed) are removed and cloned again.
+    """
     print("Updating submodules...")
     _drop_sparse_checkout(repo_dir)
-    git_ops.run_with_retry(["git", "submodule", "update", "--init"], cwd=repo_dir)
+    git_ops.run_no_check(["git", "submodule", "sync", "--quiet"], cwd=repo_dir)
+    update = ["git", "submodule", "update", "--init", "--force"]
+    if git_ops.run(update, cwd=repo_dir, check=False, stream=True).returncode == 0:
+        return
+    for path in _broken_submodules(repo_dir):
+        _remove_submodule(repo_dir, path)
+    git_ops.run(["git", "submodule", "sync", "--quiet"], cwd=repo_dir)
+    git_ops.run_with_retry(update, cwd=repo_dir)
+
+
+def _broken_submodules(repo_dir: str) -> list[str]:
+    """Paths of submodules whose checked out commit isn't the one recorded in the index (or can't be read)."""
+    broken = []
+    for line in git_ops.run(["git", "ls-files", "--stage"], cwd=repo_dir).stdout.splitlines():
+        info, _, path = line.partition("\t")
+        mode, sha, _ = info.split()
+        if mode != "160000":
+            continue
+        head = git_ops.run_no_check(["git", "rev-parse", "HEAD"], cwd=os.path.join(repo_dir, path)).stdout.strip()
+        if head != sha:
+            broken.append(path)
+    return broken
+
+
+def _remove_submodule(repo_dir: str, path: str) -> None:
+    """Remove the submodule at path: its work tree, .git/config section and repository in .git/modules."""
+    print(f"Removing submodule {path} to clone it again")
+    git_ops.run_no_check(["git", "submodule", "deinit", "--force", "--", path], cwd=repo_dir)
+    shutil.rmtree(os.path.join(repo_dir, path), ignore_errors=True)
+    out = git_ops.run_no_check(
+        ["git", "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], cwd=repo_dir,
+    ).stdout
+    common_dir = git_ops.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo_dir,
+    ).stdout.strip()
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if value == path:
+            shutil.rmtree(os.path.join(common_dir, "modules", key[len("submodule."):-len(".path")]), ignore_errors=True)
 
 
 def _drop_sparse_checkout(repo_dir: str) -> None:

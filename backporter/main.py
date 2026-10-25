@@ -22,6 +22,7 @@ the version, and a bump of one flavor of X.Y implies every flavor of X.Y and not
 
 import argparse
 import os
+import pty
 import re
 import sys
 from collections import defaultdict
@@ -35,7 +36,7 @@ from github.Repository import Repository
 from backporter import ai, ci, git_ops, github_guard, pr_body
 from backporter.github_guard import guarded_github
 from backporter.config import (
-    CONFIG_PATH, FLAVORS, TARGET_REPO, Config, Version, find_version, load_config, load_dirs, load_dotenv,
+    CONFIG_PATH, FLAVORS, LOG_PATH, TARGET_REPO, Config, Version, find_version, load_config, load_dirs, load_dotenv,
     parse_project_url, save_project,
 )
 from backporter.project import (
@@ -53,6 +54,8 @@ BUILD_ATTEMPTS = 3
 SOURCES_PER_READ = 50
 # Note prefix of items `check` has tried; later checks skip them.
 CHECKED = "Checked:"
+# Set in the re-run that run_logged() makes.
+_LOGGED_ENV = "BACKPORTER_LOGGED"
 
 
 def source_url(pr_repo: str, number: int) -> str:
@@ -1259,7 +1262,27 @@ def cmd_describe(args, gh: Github, config: Config) -> None:
     print("\n".join(pr_body.attribute(entry, pr.html_url, pr.user.login if pr.user else "")))
 
 
+def run_logged() -> int:
+    """
+    Re-run this command in a pseudo-terminal (so prompts and git progress work as usual), copying everything it
+    prints to LOG_PATH. Returns its exit code.
+    """
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    os.environ[_LOGGED_ENV] = "1"
+    with open(LOG_PATH, "wb", buffering=0) as log:
+        def read(fd: int) -> bytes:
+            data = os.read(fd, 1024)
+            log.write(data)
+            return data
+        status = pty.spawn([sys.executable, *sys.argv], read)
+    code = os.waitstatus_to_exitcode(status)
+    # Killed by a signal: report it as shells do (e.g. 130 for Ctrl-C).
+    return code if code >= 0 else 128 - code
+
+
 def main() -> None:
+    if _LOGGED_ENV not in os.environ and sys.stdout.isatty():
+        sys.exit(run_logged())
     # Show progress immediately even when output goes to a pipe or a log file.
     sys.stdout.reconfigure(line_buffering=True)
     load_dotenv()
