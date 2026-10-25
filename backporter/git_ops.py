@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 from github.PullRequest import PullRequest
 
@@ -27,6 +28,22 @@ def run(cmd: list[str], cwd: str | None = None, check: bool = True, stream: bool
         print(result.stderr, file=sys.stderr)
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
     return result
+
+
+_RETRY_ATTEMPTS = 3
+_RETRY_SECONDS = 10
+
+
+def run_with_retry(cmd: list[str], cwd: str | None = None) -> None:
+    """Run a streamed command that may fail transiently (e.g. on network errors), retrying it a few times."""
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        if run(cmd, cwd=cwd, check=False, stream=True).returncode == 0:
+            return
+        if attempt < _RETRY_ATTEMPTS:
+            print(f"Command failed (attempt {attempt}/{_RETRY_ATTEMPTS}); retrying in {_RETRY_SECONDS}s...",
+                  file=sys.stderr, flush=True)
+            time.sleep(_RETRY_SECONDS)
+    raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
 
 def run_no_check(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -189,7 +206,7 @@ def _start_branch(repo_dir: str, target_repo: str, target_branch: str, backport_
     check_repo_dir(repo_dir)
     check_origin(repo_dir, target_repo)
     print(f"Fetching latest {target_branch} from {target_repo}...")
-    run(["git", "fetch", "origin", target_branch], cwd=repo_dir, stream=True)
+    run_with_retry(["git", "fetch", "origin", target_branch], cwd=repo_dir)
     co_result = run_no_check(["git", "checkout", target_branch], cwd=repo_dir)
     if co_result.returncode != 0 and is_unresolved_state(co_result.stderr):
         print(co_result.stderr, file=sys.stderr)
@@ -197,13 +214,13 @@ def _start_branch(repo_dir: str, target_repo: str, target_branch: str, backport_
             raise RuntimeError("Aborted; repo left as is")
         abort_in_progress(repo_dir)
         run(["git", "checkout", target_branch], cwd=repo_dir)
-        run(["git", "pull", "origin", target_branch], cwd=repo_dir, stream=True)
+        run_with_retry(["git", "pull", "origin", target_branch], cwd=repo_dir)
         run_no_check(["git", "branch", "-D", backport_branch], cwd=repo_dir)
     else:
         if co_result.returncode != 0:
             print(co_result.stderr, file=sys.stderr)
             raise RuntimeError(f"Command failed: git checkout {target_branch}")
-        run(["git", "pull", "origin", target_branch], cwd=repo_dir, stream=True)
+        run_with_retry(["git", "pull", "origin", target_branch], cwd=repo_dir)
 
     if branch_exists(repo_dir, backport_branch):
         question = f"Branch '{backport_branch}' already exists. Delete and recreate from clean target?"
@@ -218,14 +235,14 @@ def _start_branch(repo_dir: str, target_repo: str, target_branch: str, backport_
 def _fetch_source(repo_dir: str, target_repo: str, source_repo: str, *fetch_args: str) -> None:
     """`git fetch <remote> *fetch_args` from origin if source_repo is target_repo, else from `upstream` (added/updated)."""
     if target_repo == source_repo:
-        run(["git", "fetch", "origin", *fetch_args], cwd=repo_dir, stream=True)
+        run_with_retry(["git", "fetch", "origin", *fetch_args], cwd=repo_dir)
         return
     fetch_url = f"https://github.com/{source_repo}.git"
     result = run_no_check(["git", "remote", "add", "upstream", fetch_url], cwd=repo_dir)
     if result.returncode != 0 and "already exists" in result.stderr:
         run(["git", "remote", "set-url", "upstream", fetch_url], cwd=repo_dir)
     print(f"Fetching from upstream ({source_repo})...")
-    run(["git", "fetch", "upstream", *fetch_args], cwd=repo_dir, stream=True)
+    run_with_retry(["git", "fetch", "upstream", *fetch_args], cwd=repo_dir)
 
 
 def _conflicts_or_fail(repo_dir: str, result: subprocess.CompletedProcess, cmd: list[str]) -> list[tuple[str, str]]:
@@ -422,10 +439,10 @@ def checkout_pr_branch(repo_dir: str, target_repo: str, target_branch: str, bran
     dirty = run(["git", "status", "--porcelain", "--untracked-files=no", "--ignore-submodules"], cwd=repo_dir).stdout
     if dirty.strip() or is_cherry_pick_in_progress(repo_dir) or is_merge_in_progress(repo_dir):
         raise RuntimeError(f"{repo_dir} has local changes or a cherry-pick/merge in progress; clean it first")
-    run(
+    run_with_retry(
         ["git", "fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
          f"+refs/heads/{target_branch}:refs/remotes/origin/{target_branch}"],
-        cwd=repo_dir, stream=True,
+        cwd=repo_dir,
     )
     remote = run(["git", "rev-parse", f"refs/remotes/origin/{branch}"], cwd=repo_dir).stdout.strip()
     if remote != sha:
@@ -464,4 +481,4 @@ def discard_changes(repo_dir: str) -> None:
 def push(repo_dir: str, branch: str, target_repo: str) -> None:
     check_origin(repo_dir, target_repo)
     print(f"Pushing {branch} to {target_repo}...")
-    run(["git", "push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo_dir, stream=True)
+    run_with_retry(["git", "push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo_dir)

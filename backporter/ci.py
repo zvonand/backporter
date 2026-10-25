@@ -100,7 +100,7 @@ def failures(repo: Repository, pr_number: int, sha: str) -> list[Failure] | None
 def update_submodules(repo_dir: str) -> None:
     print("Updating submodules...")
     _drop_sparse_checkout(repo_dir)
-    git_ops.run(["git", "submodule", "update", "--init"], cwd=repo_dir, stream=True)
+    git_ops.run_with_retry(["git", "submodule", "update", "--init"], cwd=repo_dir)
 
 
 def _drop_sparse_checkout(repo_dir: str) -> None:
