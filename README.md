@@ -13,6 +13,8 @@ Name only the **oldest** version that needs the change. The newer ones are added
 
 Version keys look like `stable-25.8` or `antalya-26.3`. Each version has its own view (tab) in the project, named by its key.
 
+**Unmerged PRs.** A PR can be requested before it's merged, and its Antalya versions can be backported before then too. Stable versions wait until it's merged: until then `start`, `run` and `check` skip them. While the PR is open, the change is taken from GitHub's test merge commit (the PR merged into its base branch). So the PR must be open and mergeable into its base; a PR closed without merging can't be backported.
+
 ### From the project's web page (nothing to install)
 
 1. Open the [project](https://github.com/orgs/Altinity/projects/39). It opens on the **Requests** view.
@@ -305,11 +307,11 @@ backporter scan [--version KEY]
 backporter start <PR-URL> [<version> ...] [--ai]
 ```
 
-Backports a merged PR (or, given a release URL, does a bump) right away. Running it counts as the decision, so no approval is needed. Without versions it takes all of the PR's `Not started` items that aren't `Discarded`; with versions it takes those (they must already be added, in any status). Every version needs a clone dir (see below). The versions are processed oldest first, and for each one, in its clone dir, it:
+Backports a PR (or, given a release URL, does a bump) right away. An unmerged PR is backported only to Antalya versions; stable versions are skipped until it's merged (see [Unmerged PRs](#requesting-a-backport)). Running it counts as the decision, so no approval is needed. Without versions it takes all of the PR's `Not started` items that aren't `Discarded`; with versions it takes those (they must already be added, in any status). Every version needs a clone dir (see below). The versions are processed oldest first, and for each one, in its clone dir, it:
 
 1. Fetches and checks out the target branch and pulls it.
 2. Creates `backports/<branch>/<N>`.
-3. Cherry-picks the PR's merge commit with `-m 1`. If the PR is not from `Altinity/ClickHouse`, the commit is fetched from an `upstream` remote, which is added or updated automatically.
+3. Cherry-picks the PR's merge commit with `-m 1` (for an unmerged PR: its test merge commit, which GitHub makes while the PR is open and mergeable). If the PR is not from `Altinity/ClickHouse`, the commit is fetched from an `upstream` remote, which is added or updated automatically.
    For a bump, the branch is `bump/<branch>/<X.Y.Z>` and this step fetches only the release's tag from `upstream` and runs `git merge --no-ff <tag>`.
 4. Pushes the branch to `origin`.
 5. Opens a PR into the target branch titled `<Stable|Antalya> X.Y Backport of #N - <exact source PR title>`, with the labels configured for its version (see Configuration). If an open PR already exists for the branch, it is reused. The body is built before anything is pushed (see [PR body](#pr-body)).
@@ -355,7 +357,7 @@ The command for working through the project, by hand or on a schedule:
 AI conflict resolution is on by default. Set `[run] ai = false` in `config.toml` to turn it off, or pass `--no-ai` for one run. If neither the `claude` CLI nor `ANTHROPIC_API_KEY` is available, `run` says so and continues without AI. `start --ai`/`continue --ai` stop with an error instead.
 
 Unlike `start`, a problem doesn't stop the whole run:
-- An item whose version has no clone dir, or whose source PR isn't merged yet, is skipped and stays queued.
+- An item whose version has no clone dir, or a stable item whose source PR isn't merged yet, is skipped and stays queued.
 - An error (e.g. a misconfigured clone) is written to the item's `Note`, and the item stays queued for the next run.
 - Unresolved conflicts set `Conflicts`, and that attempt is dropped (cherry-pick aborted, branch deleted) so the shared clone stays clean for the next PR. `Note` lists the conflicted files and how to do it by hand: `backporter start <PR> <version>`, resolve, then `backporter continue <PR> <version>`. The run goes on with the remaining versions and PRs.
 
@@ -367,7 +369,7 @@ The run exits with code 1 if anything failed or needs a human.
 backporter check
 ```
 
-Tries undecided items locally, so that fewer of them need a decision. Nothing is pushed and no PR is opened; only the project row is updated. It takes every item with Status `Not started`, an empty Decision and a `Note` that doesn't start with `Checked:` (items it has already tried). It skips those whose version has no clone dir, whose source PR isn't merged yet, or that already have a backport PR (`scan` updates those). For each remaining item, oldest version first, it does steps 1–3 of [`start`](#start) (a leftover local branch is recreated without asking) and, on conflicts, lets the AI resolve them as `start --ai` does. AI is used whenever it's available; if it isn't, `check` says so and goes on without it.
+Tries undecided items locally, so that fewer of them need a decision. Nothing is pushed and no PR is opened; only the project row is updated. It takes every item with Status `Not started`, an empty Decision and a `Note` that doesn't start with `Checked:` (items it has already tried). It skips those whose version has no clone dir, stable ones whose source PR isn't merged yet, and those that already have a backport PR (`scan` updates those). For each remaining item, oldest version first, it does steps 1–3 of [`start`](#start) (a leftover local branch is recreated without asking) and, on conflicts, lets the AI resolve them as `start --ai` does. AI is used whenever it's available; if it isn't, `check` says so and goes on without it.
 
 | Result | Branch | Row |
 |---|---|---|

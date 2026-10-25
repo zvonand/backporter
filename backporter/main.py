@@ -137,6 +137,16 @@ def load_source(gh: Github, text: str) -> Source:
     return Source(url, repo, pr=gh.get_repo(repo).get_pull(number))
 
 
+def ready_targets(source: Source, targets: list[Version]) -> list[Version]:
+    """targets without the stable ones while the source PR isn't merged: only Antalya versions take unmerged PRs."""
+    if not source.pr or source.pr.merged:
+        return targets
+    skipped = [v.key for v in targets if v.flavor != "antalya"]
+    if skipped:
+        print(f"{', '.join(skipped)}: source PR is not merged yet; skipped", file=sys.stderr)
+    return [v for v in targets if v.flavor == "antalya"]
+
+
 def backport_branch(version: Version, url: str) -> str:
     """backports/<branch>/<PR number>, or bump/<branch>/<X.Y.Z> for a release."""
     if is_bump(url):
@@ -856,7 +866,7 @@ def backport(
     By default it stops there, leaving the conflicts in progress for `continue`. With keep_clone_clean (for `run`,
     where clones are shared) it drops that attempt, notes how to redo it by hand, and goes on with the next version.
     """
-    ref = source.tag or git_ops.get_merge_commit_sha(source.pr)
+    ref = source.tag or git_ops.get_merge_commit_sha(source.pr, all(v.flavor == "antalya" for v in targets))
     apply = git_ops.merge_tag if source.tag else git_ops.cherry_pick
     for v in targets:
         git_ops.check_repo_dir(dirs[v.key])
@@ -920,6 +930,7 @@ def cmd_start(args, gh: Github, config: Config) -> None:
             v for v in versions
             if v.key in items and items[v.key].status == NOT_STARTED and items[v.key].decision != DISCARDED
         ]
+    targets = ready_targets(source, targets)
     if not targets:
         print("Nothing to start.")
         return
@@ -965,8 +976,8 @@ def cmd_run(args, gh: Github, config: Config) -> None:
         items = {i.version: i for i in its}
         try:
             source = load_source(gh, url)
-            if source.pr and not source.pr.merged:
-                print("Source PR is not merged yet; skipped", file=sys.stderr)
+            targets = ready_targets(source, targets)
+            if not targets:
                 continue
             if not backport(gh, project, config, source, items, targets, dirs, use_ai, keep_clone_clean=True):
                 failed = True
@@ -990,7 +1001,7 @@ def check_version(
     """
     branch = backport_branch(version, source.url)
     apply = git_ops.merge_tag if source.tag else git_ops.cherry_pick
-    ref = source.tag or git_ops.get_merge_commit_sha(source.pr)
+    ref = source.tag or git_ops.get_merge_commit_sha(source.pr, version.flavor == "antalya")
     outcome, conflicts = apply(repo_dir, TARGET_REPO, version.branch, branch, source.repo, ref, True)
     if outcome == git_ops.EMPTY:
         record_present(gh, project, item, version, source, repo_dir)
@@ -1069,10 +1080,7 @@ def cmd_check(args, gh: Github, config: Config) -> None:
             continue
         try:
             source = load_source(gh, url)
-            if source.pr and not source.pr.merged:
-                print("Source PR is not merged yet; skipped", file=sys.stderr)
-                continue
-            for v in sort_versions(targets):
+            for v in sort_versions(ready_targets(source, targets)):
                 print(f"\n=== {v.key} ===")
                 if find_backport_pr(repo, items[v.key], v):
                     print("It has a backport PR already; skipped (`backporter scan` updates it)")

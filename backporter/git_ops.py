@@ -162,8 +162,20 @@ def release_number(tag: str) -> tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
-def get_merge_commit_sha(pr: PullRequest) -> str:
-    """Return the merge commit SHA of a merged PR."""
+def get_merge_commit_sha(pr: PullRequest, unmerged_ok: bool = False) -> str:
+    """
+    Return the merge commit SHA of a merged PR. With unmerged_ok, an open PR gives its test merge commit
+    (GitHub's merge of the PR into its base branch); its first parent is the base, as for a merge commit.
+    """
+    if not pr.merged and unmerged_ok:
+        if pr.state != "open":
+            raise RuntimeError(f"PR #{pr.number} is closed without being merged")
+        if not pr.mergeable or not pr.merge_commit_sha:
+            raise RuntimeError(
+                f"PR #{pr.number} has no test merge commit (it conflicts with its base branch, or GitHub "
+                f"hasn't checked yet; retry later)"
+            )
+        return pr.merge_commit_sha
     if not pr.merged:
         raise RuntimeError(f"PR #{pr.number} is not merged yet")
     if not pr.merge_commit_sha:
