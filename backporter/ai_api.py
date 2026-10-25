@@ -1,8 +1,8 @@
 """
-Agent on the Anthropic API (conflict resolution, CI fixes), with locally executed, restricted tools.
+Agent on the Anthropic API (conflict resolution, reviews, CI fixes), with locally executed, restricted tools.
 
 Bash runs a single command without a shell, and only allowlisted commands (see ai.GIT_SUBCOMMANDS,
-ai.OTHER_COMMANDS). File tools are confined to the repo dir.
+ai.OTHER_COMMANDS; ai.READ_GIT_SUBCOMMANDS for a read-only agent). File tools are confined to the repo dir.
 """
 
 import os
@@ -23,13 +23,14 @@ SYSTEM = (
     "Follow the task's output contract exactly: end with the lines it asks for."
 )
 
-TOOLS = [
-    {
+
+def _bash_tool(git_subcommands: tuple[str, ...]) -> dict:
+    checkout = " (checkout only with --ours/--theirs)" if "checkout" in git_subcommands else ""
+    return {
         "name": "bash",
         "description": (
             "Run one command in the repo (no shell: no pipes, redirections, `&&`, `;` or `$()`). "
-            f"Allowed: git {', git '.join(ai.GIT_SUBCOMMANDS)} (checkout only with --ours/--theirs), "
-            f"and {', '.join(ai.OTHER_COMMANDS)}."
+            f"Allowed: git {', git '.join(git_subcommands)}{checkout}, and {', '.join(ai.OTHER_COMMANDS)}."
         ),
         "eager_input_streaming": True,
         "input_schema": {
@@ -37,7 +38,11 @@ TOOLS = [
             "properties": {"command": {"type": "string"}},
             "required": ["command"],
         },
-    },
+    }
+
+
+TOOLS = [
+    _bash_tool(ai.GIT_SUBCOMMANDS),
     {
         "name": "read_file",
         "description": "Read a file in the repo, with line numbers. Optional 1-based offset and line limit.",
@@ -71,16 +76,16 @@ TOOLS = [
         },
     },
 ]
-_SCHEMAS = {t["name"]: t["input_schema"] for t in TOOLS}
+READ_ONLY_TOOLS = [_bash_tool(ai.READ_GIT_SUBCOMMANDS), TOOLS[1]]
 
 
 class ToolError(Exception):
     pass
 
 
-def _validate(name: str, args: object) -> None:
+def _validate(name: str, args: object, tools: list[dict]) -> None:
     """Schema check for tool input; with eager streaming the API does not validate it."""
-    schema = _SCHEMAS.get(name)
+    schema = next((t["input_schema"] for t in tools if t["name"] == name), None)
     if schema is None:
         raise ToolError(f"unknown tool {name}")
     if not isinstance(args, dict):
@@ -102,7 +107,7 @@ def _path(repo_dir: str, path: str) -> str:
     return full
 
 
-def _bash(repo_dir: str, command: str, env: dict[str, str]) -> str:
+def _bash(repo_dir: str, command: str, env: dict[str, str], git_subcommands: tuple[str, ...]) -> str:
     if any(ch in command for ch in "\n;&|<>`$"):
         raise ToolError("one plain command only: no pipes, redirections, `;`, `&&`, `$` or backticks")
     argv = shlex.split(command)
@@ -110,7 +115,7 @@ def _bash(repo_dir: str, command: str, env: dict[str, str]) -> str:
         raise ToolError("empty command")
     if argv[0] == "git":
         sub = argv[1] if len(argv) > 1 else ""
-        if sub not in ai.GIT_SUBCOMMANDS:
+        if sub not in git_subcommands:
             raise ToolError(f"git subcommand not allowed: {' '.join(argv[:2])}")
         if sub == "checkout" and argv[2:3] not in (["--ours"], ["--theirs"]):
             raise ToolError("only `git checkout --ours|--theirs <paths>` is allowed")
@@ -154,9 +159,9 @@ def _write(repo_dir: str, args: dict) -> str:
     return "ok"
 
 
-def _execute(repo_dir: str, name: str, args: dict, env: dict[str, str]) -> str:
+def _execute(repo_dir: str, name: str, args: dict, env: dict[str, str], read_only: bool) -> str:
     if name == "bash":
-        return _bash(repo_dir, args["command"], env)
+        return _bash(repo_dir, args["command"], env, ai.READ_GIT_SUBCOMMANDS if read_only else ai.GIT_SUBCOMMANDS)
     if name == "read_file":
         return _read(repo_dir, args)
     if name == "edit_file":
@@ -182,8 +187,9 @@ def complete(prompt: str, api_key: str) -> str:
     return "".join(b.text for b in response.content if b.type == "text")
 
 
-def run_agent(repo_dir: str, prompt: str, api_key: str, env: dict[str, str]) -> str:
-    """Run the agent loop and return its final text."""
+def run_agent(repo_dir: str, prompt: str, api_key: str, env: dict[str, str], read_only: bool = False) -> str:
+    """Run the agent loop (with READ_ONLY_TOOLS if read_only) and return its final text."""
+    tools = READ_ONLY_TOOLS if read_only else TOOLS
     client = anthropic.Anthropic(api_key=api_key)
     messages: list[dict] = [{"role": "user", "content": prompt}]
     deadline = time.monotonic() + ai.TIMEOUT_SECONDS
@@ -197,7 +203,7 @@ def run_agent(repo_dir: str, prompt: str, api_key: str, env: dict[str, str]) -> 
                 max_tokens=64000,
                 system=SYSTEM,
                 messages=messages,
-                tools=TOOLS,
+                tools=tools,
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
                 cache_control={"type": "ephemeral"},
@@ -230,8 +236,8 @@ def run_agent(repo_dir: str, prompt: str, api_key: str, env: dict[str, str]) -> 
         for block in tool_uses:
             ai.print_tool_use(block.name, block.input)
             try:
-                _validate(block.name, block.input)
-                content, is_error = _execute(repo_dir, block.name, block.input, env), False
+                _validate(block.name, block.input, tools)
+                content, is_error = _execute(repo_dir, block.name, block.input, env, read_only), False
             except (ToolError, OSError, subprocess.TimeoutExpired, ValueError) as e:
                 content, is_error = f"Error: {e}", True
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": content, "is_error": is_error})

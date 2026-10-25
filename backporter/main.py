@@ -50,6 +50,8 @@ from backporter.rules import closure, plan_remove, sort_versions
 _VERSION_KEY_RE = re.compile(r"\b(?:stable|antalya)-\d+\.\d+\b")
 # AI attempts at a CI fix that builds, in `inspect`.
 BUILD_ATTEMPTS = 3
+# AI resolutions of a backport's conflicts, each checked by a fresh reviewer (see reviewed).
+REVIEW_ATTEMPTS = 3
 # Source PRs per filtered project read; GitHub doesn't document the filter's length limit (120 URLs worked).
 SOURCES_PER_READ = 50
 # Note prefix of items `check` has tried; later checks skip them.
@@ -806,6 +808,8 @@ def ai_resolution(
             conflict_sha,
         )
     result = ai.resolve(repo_dir, prompt, conflicts)
+    if not source.tag:
+        result = reviewed(version, source, repo_dir, conflicts, conflict_sha, prompt, result)
     resolution_sha = ""
     if result.outcome == ai.RESOLVED:
         resolution_sha = git_ops.commit_resolution(
@@ -813,6 +817,47 @@ def ai_resolution(
         )
         print(f"Committed the resolution: {resolution_sha[:12]}")
     return result, conflict_sha, resolution_sha
+
+
+def reviewed(
+    version: Version, source: Source, repo_dir: str, conflicts: list[tuple[str, str]], conflict_sha: str,
+    prompt: str, result: ai.Result,
+) -> ai.Result:
+    """
+    Let a fresh AI review a backport the AI RESOLVED (still uncommitted). A backport it finds wrong or incomplete goes
+    back to the resolver with its findings, up to REVIEW_ATTEMPTS resolutions in all; if it is still wrong, or the
+    review fails, the result is UNRESOLVED. A review that finds it already present or not applicable discards the
+    resolution and becomes the result.
+    """
+    pr = source.pr
+    review_prompt = ai.build_review_prompt(
+        repo_dir, version.branch, pr.html_url, pr.title, pr.body or "", source.sha, conflict_sha,
+    )
+    attempt = 1
+    while result.outcome == ai.RESOLVED:
+        print(f"\nAI review of resolution {attempt}/{REVIEW_ATTEMPTS}...")
+        review = ai.review(repo_dir, review_prompt)
+        if review.outcome == ai.VALID:
+            result.review = review.note
+            break
+        if review.outcome in (ai.ALREADY_PRESENT, ai.NOT_APPLICABLE):
+            git_ops.discard_changes(repo_dir)
+            return ai.Result(review.outcome, f"review: {review.note}", review.by, review.summary)
+        if review.outcome != ai.INVALID:
+            return ai.Result(ai.UNRESOLVED, f"review failed: {review.note}")
+        if attempt == REVIEW_ATTEMPTS:
+            return ai.Result(
+                ai.UNRESOLVED, f"review still finds it wrong after {attempt} resolutions: {review.note}",
+                summary=review.summary,
+            )
+        attempt += 1
+        prompt += (
+            f"\n\nA reviewer checked your resolution (still in the working tree, `git diff {version.branch}`) "
+            f"and found it wrong or incomplete:\n<review>\n{review.note}\n{review.summary}\n</review>\n"
+            f"Address every finding, then report the outcome again."
+        )
+        result = ai.resolve(repo_dir, prompt, conflicts)
+    return result
 
 
 def resolve_with_ai(
@@ -830,7 +875,8 @@ def resolve_with_ai(
         if not source.tag and git_ops.same_tree(repo_dir, version.branch):
             record_present(gh, project, item, version, source, repo_dir, f"AI: {result.note}")
             return True
-        project.set_value(item.id, F_NOTE, f"AI resolved conflicts: {result.note}")
+        review = f"; AI review: {result.review}" if result.review else ""
+        project.set_value(item.id, F_NOTE, f"AI resolved conflicts: {result.note}{review}")
         comment = conflict_comment(conflicts, conflict_sha, resolution_sha, result, source.operation)
         return finish_backport(gh, project, config, item, version, source, repo_dir, comment)
     if not source.tag and result.outcome == ai.ALREADY_PRESENT:
@@ -1053,7 +1099,8 @@ def check_version(
             project.set_value(item.id, F_NOTE, f"{CHECKED} AI could not resolve conflicts in {files}: {result.note}")
             print(f"{version.key}: AI could not resolve the conflicts; branch dropped")
             return
-        note = f"{CHECKED} AI resolved conflicts: {result.note}; local branch {branch} kept"
+        review = f"; AI review: {result.review}" if result.review else ""
+        note = f"{CHECKED} AI resolved conflicts: {result.note}{review}; local branch {branch} kept"
         comment = conflict_comment(conflicts, conflict_sha, resolution_sha, result, source.operation)
     git_ops.keep_checked(repo_dir, branch, comment)
     project.set_value(item.id, F_NOTE, note)

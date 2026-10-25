@@ -330,14 +330,16 @@ It then continues with the next version.
 
 **Conflicts without `--ai`.** It sets Status `Conflicts`, prints the conflicted files, leaves the branch with conflicts in the clone dir, and stops (exit code 1). Versions after it are not started.
 
-**Conflicts with `--ai`.** The backporter first commits the cherry-pick (for a bump, the merge) **as-is, with the conflict markers**. That commit keeps the original message and adds "Conflicts committed as-is; the next commit resolves them" and the list of files. The AI then resolves the conflicts in the clone dir (see [AI conflict resolution](#ai-conflict-resolution)) and reports one outcome. A successful resolution becomes a **second, separate commit**, so reviewers see exactly what the AI changed.
+**Conflicts with `--ai`.** The backporter first commits the cherry-pick (for a bump, the merge) **as-is, with the conflict markers**. That commit keeps the original message and adds "Conflicts committed as-is; the next commit resolves them" and the list of files. The AI then resolves the conflicts in the clone dir (see [AI conflict resolution](#ai-conflict-resolution)) and reports one outcome. For a backport, a `RESOLVED` outcome is first checked by a fresh AI reviewer, which can change the outcome (see [AI review](#ai-review)). A successful resolution becomes a **second, separate commit**, so reviewers see exactly what the AI changed.
 
 | AI outcome | What the backporter does |
 |---|---|
-| `RESOLVED` | Checks that HEAD hasn't moved and no conflict markers are left, then commits the resolution ("Resolve conflicts in backport of #N" with the AI's note). It continues with steps 4–6, writes `AI resolved conflicts: <note>` to `Note`, and posts **one comment on the backport PR** with the conflicted files, the two commits and the AI's short summary of what conflicted and how it was resolved. If a backport's branch ends up identical to the target branch, the item is marked `Already present` as above; a bump's merge is kept. |
+| `RESOLVED` | Checks that HEAD hasn't moved and no conflict markers are left, then commits the resolution ("Resolve conflicts in backport of #N" with the AI's note). It continues with steps 4–6, writes `AI resolved conflicts: <note>; AI review: <reviewer's note>` to `Note` (a bump has no review part), and posts **one comment on the backport PR** with the conflicted files, the two commits and the AI's short summary of what conflicted and how it was resolved. If a backport's branch ends up identical to the target branch, the item is marked `Already present` as above; a bump's merge is kept. |
 | `ALREADY_PRESENT` | Drops the branch and marks `Already present`, using the PR the AI names or, failing that, the lookup above. Not offered for a bump. |
 | `NOT_APPLICABLE` | Drops the branch and marks `Not applicable` with the AI's reason in `Note`. Not offered for a bump. |
 | `UNRESOLVED` | Undoes the conflict commit and redoes the cherry-pick (or merge), so the conflicts are in progress again for a human (`continue`). Sets `Conflicts` with the AI's reason in `Note`, and stops. |
+
+The reviewer's `ALREADY_PRESENT` or `NOT_APPLICABLE` is handled like the resolver's, with `AI: review: <reason>` in `Note`. When the reviewer still finds the backport wrong after the last resolution, or gives no outcome, the result is `UNRESOLVED`.
 
 If the backport branch already exists locally, it depends on the item:
 - `Not started` with no backport PR: a branch kept by [`check`](#check) is reused as it is (no new cherry-pick or merge): it is pushed and gets its PR (steps 4–7), with the AI's conflict comment if `check` had the AI resolve conflicts. Any other leftover branch is recreated from a clean target without asking.
@@ -374,11 +376,11 @@ Tries undecided items locally, so that fewer of them need a decision. Nothing is
 
 | Result | Branch | Row |
 |---|---|---|
-| Already in the branch: the cherry-pick is empty (for a bump: the tag is in the branch), the AI says `ALREADY_PRESENT`, or a backport's AI resolution changes nothing | deleted | Status `Already present`, Decision `Discarded`, and `Backport PR`/`Note` as in [`start`](#start) |
-| AI says `NOT_APPLICABLE` | deleted | Status `Not applicable`, Decision `Discarded`, `Note` `AI: <reason>` |
+| Already in the branch: the cherry-pick is empty (for a bump: the tag is in the branch), the AI or its reviewer says `ALREADY_PRESENT`, or a backport's AI resolution changes nothing | deleted | Status `Already present`, Decision `Discarded`, and `Backport PR`/`Note` as in [`start`](#start) |
+| The AI or its reviewer says `NOT_APPLICABLE` | deleted | Status `Not applicable`, Decision `Discarded`, `Note` `AI: <reason>` (`AI: review: <reason>` from the reviewer) |
 | Applies cleanly | kept | `Note` `Checked: the cherry-pick applies cleanly; local branch <branch> kept` |
-| AI resolved the conflicts | kept, with the conflict and resolution commits | `Note` `Checked: AI resolved conflicts: <note>; local branch <branch> kept` |
-| AI couldn't resolve them, or no AI | deleted (with the AI's edits) | `Note` `Checked: AI could not resolve conflicts in <files>: <reason>` (or `...; AI unavailable to resolve them`); nothing else changes |
+| AI resolved the conflicts (and, for a backport, its reviewer accepted the result) | kept, with the conflict and resolution commits | `Note` `Checked: AI resolved conflicts: <note>; AI review: <reviewer's note>; local branch <branch> kept` (a bump has no review part) |
+| AI couldn't resolve them (or its reviewer kept finding the result wrong), or no AI | deleted (with the AI's edits) | `Note` `Checked: AI could not resolve conflicts in <files>: <reason>` (or `...; AI unavailable to resolve them`); nothing else changes |
 
 A kept branch is marked in the clone's git config (`branch.<branch>.backporterChecked`, holding the AI's conflict comment for the PR, if any). Once the item is `Approved`, `run` (or `start`) pushes that branch as it is and opens its PR, without cherry-picking again (see [`start`](#start)). The branch isn't updated if the target branch moves in the meantime. Deleting the branch (`git branch -D`) removes the mark, and the item is then backported from scratch.
 
@@ -452,6 +454,26 @@ If neither the code nor the AI produces a valid body (or no AI is available, or 
   - `--permission-mode dontAsk`: only the listed tools are allowed. These are the same git and read commands as above, plus Read/Edit/Write/Glob/Grep limited to `./**`. `git push/commit/fetch/remote/config`, `gh`, `curl`, `wget`, `ssh`, web tools and credential directories are denied explicitly.
 
 In both modes the AI process gets no `GITHUB_TOKEN`/`GH_TOKEN`/`ANTHROPIC_API_KEY`, an empty `GH_CONFIG_DIR` (so `gh` is logged out), and `GIT_ALLOW_PROTOCOL=file` (so git can't reach any remote). The AI only edits and stages files. Committing (the conflict commit and the resolution commit), pushing, opening PRs, the summary comment and updating the project are done by the backporter under the safety rules above. Besides OUTCOME and NOTE, the AI ends its answer with a SUMMARY: 2-5 bullet points for reviewers, posted in the comment.
+
+### AI review
+
+When the AI reports `RESOLVED` for a backport (not for a bump), a fresh agent reviews the result before anything is committed. It gets the source PR's title, description and change (`git diff <merge commit>^1 <merge commit>`), the conflict commit, and the backport as it would be committed (`git diff <target branch>`). It checks that:
+- the bug the source PR fixes, or the code it changes, exists in the target branch and isn't already fixed or changed there, fully or in part;
+- the backport brings the whole change the target branch still needs, without duplicates or unrelated changes;
+- the adapted code fits the target branch: the functions, types, settings and APIs it uses exist there, and its tests fit.
+
+It reports one outcome:
+
+| Review outcome | What happens |
+|---|---|
+| `VALID` | The resolution is committed as usual; the reviewer's note goes to `Note` (`; AI review: <note>`), not to the PR comment. |
+| `ALREADY_PRESENT` | The resolution is discarded and the item is handled as for the resolver's `ALREADY_PRESENT`, using the PR the reviewer names. |
+| `NOT_APPLICABLE` | The resolution is discarded and the item is handled as for the resolver's `NOT_APPLICABLE`. |
+| `INVALID` | The reviewer's findings are added to the resolver's prompt and the resolver runs again on its previous resolution, which is still in the working tree. A fresh reviewer then checks the new result. After 3 resolutions in all (`REVIEW_ATTEMPTS` in `backporter/main.py`), a result still found wrong becomes `UNRESOLVED`. |
+
+A review without an outcome makes the result `UNRESOLVED`.
+
+The reviewer runs like the resolver, but read-only: with the API, its tools are `bash` without `git add/rm/checkout` and `read_file`; with the CLI, only Read/Glob/Grep and the read-only git and read commands are allowed.
 
 ## Clone dirs
 

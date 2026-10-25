@@ -1,5 +1,6 @@
 """
-AI resolution of cherry-pick (backport) and merge (bump) conflicts, and fixes for CI failures of backport PRs.
+AI resolution of cherry-pick (backport) and merge (bump) conflicts, reviews of those backport resolutions, and
+fixes for CI failures of backport PRs.
 
 Backend: the Anthropic API when ANTHROPIC_API_KEY is set, otherwise the `claude` CLI (Claude plan limits).
 The AI works only in the clone dir and reports one outcome; the backporter does all git/GitHub work.
@@ -28,16 +29,20 @@ OUTCOMES = (RESOLVED, ALREADY_PRESENT, NOT_APPLICABLE, UNRESOLVED)
 FIXED = "FIXED"
 UNRELATED = "UNRELATED"
 CI_OUTCOMES = (FIXED, UNRELATED, UNRESOLVED)
+# Review of a resolved backport: correct and needed, or (INVALID) needed but wrong or incomplete.
+VALID = "VALID"
+INVALID = "INVALID"
+REVIEW_OUTCOMES = (VALID, ALREADY_PRESENT, NOT_APPLICABLE, INVALID)
 
 TIMEOUT_SECONDS = 2 * 3600
 
 _SECRET_VARS = ("GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "ANTHROPIC_API_KEY")
 
-# Read-only git subcommands plus staging; `git checkout` only as `--ours`/`--theirs`.
-GIT_SUBCOMMANDS = (
+READ_GIT_SUBCOMMANDS = (
     "status", "diff", "log", "show", "grep", "blame", "ls-files", "merge-base", "rev-parse", "cat-file",
-    "add", "rm", "checkout",
 )
+# Read-only git subcommands plus staging; `git checkout` only as `--ours`/`--theirs`.
+GIT_SUBCOMMANDS = (*READ_GIT_SUBCOMMANDS, "add", "rm", "checkout")
 OTHER_COMMANDS = ("ls", "cat", "head", "tail", "grep", "rg", "wc")
 
 _CLI_DENY = [
@@ -57,6 +62,8 @@ class Result:
     by: str = ""
     # A few Markdown lines on what conflicted and how it was resolved
     summary: str = ""
+    # The reviewer's note on a RESOLVED backport it found VALID
+    review: str = ""
 
 
 def unavailable() -> str | None:
@@ -115,6 +122,49 @@ NOTE: <one line: what you adapted, or why>
 BY: <PR URL that already brought the change; only for ALREADY_PRESENT, omit if unknown>
 SUMMARY:
 <2-5 short Markdown bullet points for reviewers: what conflicted in which file, why, and how you resolved it>
+"""
+
+
+def build_review_prompt(repo_dir: str, branch: str, pr_url: str, pr_title: str, pr_body: str, merge_sha: str,
+                        conflict_sha: str) -> str:
+    return f"""You are reviewing a ClickHouse backport whose cherry-pick conflicts another agent resolved. You didn't make it: judge it critically.
+
+Repository: {repo_dir} (your working directory)
+Target branch: {branch} (an older ClickHouse release line)
+Source PR: {pr_url}
+Source PR title: {pr_title}
+
+Source PR description:
+<pr_description>
+{pr_body or "(empty)"}
+</pr_description>
+
+The source PR's change: `git diff {merge_sha}^1 {merge_sha}`
+The cherry-pick with its conflicts committed as-is, conflict markers included: HEAD ({conflict_sha}), see `git show HEAD`
+The backport as it will be committed, the resolution included: `git diff {branch}` (the working tree against {branch})
+
+Your job: decide whether this backport makes sense for {branch} and is correct. Check that:
+- the bug the source PR fixes, or the code it changes, exists in {branch}, and isn't already fixed or changed there, fully or in part, by other commits (look at {branch} with `git log`, `git grep`, `git blame`);
+- the backport brings the whole change of the source PR that {branch} still needs, adapted to {branch}: nothing missing, nothing that duplicates what {branch} already has, nothing unrelated;
+- the adapted code fits {branch}: the functions, types, settings and APIs it uses exist there with the same meaning, and the tests it brings fit {branch}.
+
+Then decide on exactly one outcome:
+- VALID: the backport is needed and correct.
+- ALREADY_PRESENT: {branch} already has this change, or another change with the same effect, in every part that matters, so nothing needs backporting. If `git log` shows the commit or PR that brought it, give its PR URL.
+- NOT_APPLICABLE: the backport makes no sense for {branch}, e.g. the bug or the code it changes doesn't exist there. Explain why.
+- INVALID: the backport is needed but wrong or incomplete. List each problem concretely (file, what is wrong, what it should be), so that another agent can fix it.
+
+Rules:
+- Work only inside {repo_dir}. Don't edit or stage anything: you only review.
+- Use one plain command per Bash call, with no pipes, redirections or `&&`.
+- You have no network or GitHub access, so don't try to use them.
+
+End your answer with these lines, exactly:
+OUTCOME: <VALID|ALREADY_PRESENT|NOT_APPLICABLE|INVALID>
+NOTE: <one line: your verdict and its main reason>
+BY: <PR URL that already brought the change; only for ALREADY_PRESENT, omit if unknown>
+SUMMARY:
+<for INVALID, each problem as a Markdown bullet point; otherwise 2-5 short Markdown bullet points on what you checked>
 """
 
 
@@ -219,15 +269,15 @@ def check_resolved(repo_dir: str, head_before: str, conflicts: list[tuple[str, s
     return None
 
 
-def _agent(repo_dir: str, prompt: str) -> str:
-    """Run the agent in repo_dir with the edit tools; returns its final text."""
+def _agent(repo_dir: str, prompt: str, read_only: bool = False) -> str:
+    """Run the agent in repo_dir with the edit tools (or only the reading ones); returns its final text."""
     if os.environ.get("ANTHROPIC_API_KEY"):
         from backporter import ai_api
 
         print("AI: working with the Anthropic API...")
-        return ai_api.run_agent(repo_dir, prompt, os.environ["ANTHROPIC_API_KEY"], locked_env())
+        return ai_api.run_agent(repo_dir, prompt, os.environ["ANTHROPIC_API_KEY"], locked_env(), read_only)
     print("AI: working with the claude CLI...")
-    return _run_cli(repo_dir, prompt, _resolve_tools())
+    return _run_cli(repo_dir, prompt, _read_tools() if read_only else _resolve_tools())
 
 
 def resolve(repo_dir: str, prompt: str, conflicts: list[tuple[str, str]]) -> Result:
@@ -238,6 +288,16 @@ def resolve(repo_dir: str, prompt: str, conflicts: list[tuple[str, str]]) -> Res
         if problem:
             return Result(UNRESOLVED, f"AI reported resolved, but {problem}")
     print(f"AI: {result.outcome}: {result.note}")
+    return result
+
+
+def review(repo_dir: str, prompt: str) -> Result:
+    """Let a fresh agent with read-only tools judge a resolved backport (see build_review_prompt)."""
+    print("AI review: a fresh agent checks the backport...")
+    result = parse_result(_agent(repo_dir, prompt, read_only=True), REVIEW_OUTCOMES)
+    print(f"AI review: {result.outcome}: {result.note}")
+    if result.summary:
+        print(result.summary)
     return result
 
 
@@ -269,13 +329,19 @@ def print_tool_use(name: str, args: object) -> None:
     print(f"  AI [{name}] {str(detail)[:300]}")
 
 
-def _resolve_tools() -> list[str]:
+def _read_tools() -> list[str]:
     # File tools only inside the repo (paths relative to the working directory).
-    allowed = ["Read(./**)", "Edit(./**)", "Write(./**)", "Glob(./**)", "Grep(./**)"]
-    allowed += [f"Bash(git {sub} *)" for sub in GIT_SUBCOMMANDS if sub != "checkout"]
-    allowed += ["Bash(git checkout --ours *)", "Bash(git checkout --theirs *)"]
+    allowed = ["Read(./**)", "Glob(./**)", "Grep(./**)"]
+    allowed += [f"Bash(git {sub} *)" for sub in READ_GIT_SUBCOMMANDS]
     allowed += [f"Bash({cmd} *)" for cmd in OTHER_COMMANDS]
     return allowed
+
+
+def _resolve_tools() -> list[str]:
+    return [
+        *_read_tools(), "Edit(./**)", "Write(./**)", "Bash(git add *)", "Bash(git rm *)",
+        "Bash(git checkout --ours *)", "Bash(git checkout --theirs *)",
+    ]
 
 
 def _run_cli(cwd: str, prompt: str, allowed: list[str]) -> str:
