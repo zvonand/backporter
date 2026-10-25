@@ -58,7 +58,7 @@ Two columns, with separate owners:
 
 - **Decision** is yours. Set it in any view; empty means undecided, and nothing is backported until someone decides.
   - **`Approved`**: do it. The next `backporter run` backports it: cherry-pick (for a bump: merge the release's tag), push, and a labeled PR in `Altinity/ClickHouse`. AI resolves conflicts by default.
-  - **`Discarded`**: don't do it. The item stays as a record, and the backporter never touches it again.
+  - **`Discarded`**: don't do it. The item stays as a record, and the backporter never touches it again. [`backporter check`](#check) also sets it, on undecided items it finds to make no sense.
 - **Status** belongs to the backporter. Don't edit it. Together with **Note**, it shows what happened. Once a backport PR exists, the row *is* that PR, so its title links to it:
 
 | Status | Meaning |
@@ -69,7 +69,7 @@ Two columns, with separate owners:
 | `Already present` | already in that branch; `Note` names the PR that brought it, if found |
 | `Not applicable` | makes no sense for that version; `Note` says why |
 
-`backporter scan` refreshes statuses from GitHub and lists what's still pending. To backport one PR right away without approving, run `backporter start <PR>`.
+`backporter scan` refreshes statuses from GitHub and lists what's still pending. To backport one PR right away without approving, run `backporter start <PR>`. To narrow down what needs a decision, run `backporter check`: it tries the undecided items locally, discards those that make no sense, and notes how the rest went (see [`check`](#check)).
 
 ## Installation
 
@@ -336,7 +336,11 @@ It then continues with the next version.
 | `NOT_APPLICABLE` | Drops the branch and marks `Not applicable` with the AI's reason in `Note`. Not offered for a bump. |
 | `UNRESOLVED` | Undoes the conflict commit and redoes the cherry-pick (or merge), so the conflicts are in progress again for a human (`continue`). Sets `Conflicts` with the AI's reason in `Note`, and stops. |
 
-If the backport branch already exists locally, or the clone is in a conflicted/dirty state, it asks before recreating the branch from a clean target. Answering no aborts.
+If the backport branch already exists locally, it depends on the item:
+- `Not started` with no backport PR: a branch kept by [`check`](#check) is reused as it is (no new cherry-pick or merge): it is pushed and gets its PR (steps 4–7), with the AI's conflict comment if `check` had the AI resolve conflicts. Any other leftover branch is recreated from a clean target without asking.
+- Otherwise it asks before recreating the branch from a clean target. Answering no aborts.
+
+If the clone is in a conflicted/dirty state, it asks before recreating the branch from a clean target. Answering no aborts.
 
 ### `run`
 
@@ -356,6 +360,28 @@ Unlike `start`, a problem doesn't stop the whole run:
 - Unresolved conflicts set `Conflicts`, and that attempt is dropped (cherry-pick aborted, branch deleted) so the shared clone stays clean for the next PR. `Note` lists the conflicted files and how to do it by hand: `backporter start <PR> <version>`, resolve, then `backporter continue <PR> <version>`. The run goes on with the remaining versions and PRs.
 
 The run exits with code 1 if anything failed or needs a human.
+
+### `check`
+
+```bash
+backporter check
+```
+
+Tries undecided items locally, so that fewer of them need a decision. Nothing is pushed and no PR is opened; only the project row is updated. It takes every item with Status `Not started`, an empty Decision and a `Note` that doesn't start with `Checked:` (items it has already tried). It skips those whose version has no clone dir, whose source PR isn't merged yet, or that already have a backport PR (`scan` updates those). For each remaining item, oldest version first, it does steps 1–3 of [`start`](#start) (a leftover local branch is recreated without asking) and, on conflicts, lets the AI resolve them as `start --ai` does. AI is used whenever it's available; if it isn't, `check` says so and goes on without it.
+
+| Result | Branch | Row |
+|---|---|---|
+| Already in the branch: the cherry-pick is empty (for a bump: the tag is in the branch), the AI says `ALREADY_PRESENT`, or a backport's AI resolution changes nothing | deleted | Status `Already present`, Decision `Discarded`, and `Backport PR`/`Note` as in [`start`](#start) |
+| AI says `NOT_APPLICABLE` | deleted | Status `Not applicable`, Decision `Discarded`, `Note` `AI: <reason>` |
+| Applies cleanly | kept | `Note` `Checked: the cherry-pick applies cleanly; local branch <branch> kept` |
+| AI resolved the conflicts | kept, with the conflict and resolution commits | `Note` `Checked: AI resolved conflicts: <note>; local branch <branch> kept` |
+| AI couldn't resolve them, or no AI | deleted (with the AI's edits) | `Note` `Checked: AI could not resolve conflicts in <files>: <reason>` (or `...; AI unavailable to resolve them`); nothing else changes |
+
+A kept branch is marked in the clone's git config (`branch.<branch>.backporterChecked`, holding the AI's conflict comment for the PR, if any). Once the item is `Approved`, `run` (or `start`) pushes that branch as it is and opens its PR, without cherry-picking again (see [`start`](#start)). The branch isn't updated if the target branch moves in the meantime. Deleting the branch (`git branch -D`) removes the mark, and the item is then backported from scratch.
+
+An item that `check` left undecided stays `Not started` with its `Checked:` note, so later checks skip it. To check it again, clear its `Note`.
+
+Errors are printed (the item is left as it is), and `check` exits with code 1 if there were any.
 
 ### `continue`
 
@@ -412,7 +438,7 @@ If neither the code nor the AI produces a valid body (or no AI is available, or 
 
 ## AI conflict resolution
 
-`run` (unless `--no-ai` or `[run] ai = false`), `start --ai` and `continue --ai` hand conflicts to Claude, for backports and bumps alike (a bump's prompt asks to keep both upstream's and Altinity's changes, and offers only `RESOLVED` or `UNRESOLVED`):
+`run` (unless `--no-ai` or `[run] ai = false`), `check`, `start --ai` and `continue --ai` hand conflicts to Claude, for backports and bumps alike (a bump's prompt asks to keep both upstream's and Altinity's changes, and offers only `RESOLVED` or `UNRESOLVED`):
 
 - **Anthropic API**, when `ANTHROPIC_API_KEY` is set. The backporter runs the agent loop itself (`backporter/ai_api.py`, model `claude-opus-5-5`), and its tools run locally:
   - `bash` runs one command without a shell. Allowed: `git status/diff/log/show/grep/blame/ls-files/merge-base/rev-parse/cat-file/add/rm`, `git checkout --ours|--theirs`, and `ls/cat/head/tail/grep/rg/wc` on paths inside the repo.
@@ -426,7 +452,7 @@ In both modes the AI process gets no `GITHUB_TOKEN`/`GH_TOKEN`/`ANTHROPIC_API_KE
 
 ## Clone dirs
 
-`run`, `start` and `continue` (and `mark present`, for its lookup) need a local ClickHouse clone per version, with `origin` pointing to `Altinity/ClickHouse` (enforced, see Safety). One clone can serve several versions. Configure them in `~/.config/backporter/dirs.toml` (local, not committed):
+`run`, `check`, `start` and `continue` (and `mark present`, for its lookup) need a local ClickHouse clone per version, with `origin` pointing to `Altinity/ClickHouse` (enforced, see Safety). One clone can serve several versions. Configure them in `~/.config/backporter/dirs.toml` (local, not committed):
 
 ```toml
 "stable-25.8" = "~/src/releases/258"

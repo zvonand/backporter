@@ -296,6 +296,24 @@ def drop_backport_branch(repo_dir: str, target_branch: str, backport_branch: str
         run(["git", "branch", "-D", backport_branch], cwd=repo_dir)
 
 
+# Set on a backport branch that `backporter check` kept; its value is the comment for the PR ('' for none).
+# `git branch -D` removes it along with the branch.
+_CHECKED_KEY = "backporterChecked"
+
+
+def keep_checked(repo_dir: str, branch: str, comment: str) -> None:
+    """Mark branch as kept by `backporter check`, with the comment its PR gets ('' for none)."""
+    run(["git", "config", f"branch.{branch}.{_CHECKED_KEY}", comment], cwd=repo_dir)
+
+
+def checked_comment(repo_dir: str, branch: str) -> str | None:
+    """The PR comment stored by keep_checked on branch, or None if `backporter check` didn't keep it."""
+    if not branch_exists(repo_dir, branch):
+        return None
+    result = run_no_check(["git", "config", "--get", f"branch.{branch}.{_CHECKED_KEY}"], cwd=repo_dir)
+    return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+
 def is_ancestor(repo_dir: str, commit: str, ref: str) -> bool:
     return run_no_check(["git", "merge-base", "--is-ancestor", commit, ref], cwd=repo_dir).returncode == 0
 

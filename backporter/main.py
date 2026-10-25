@@ -8,6 +8,8 @@ Backport tracker backed by a GitHub Project.
     backporter scan [--version KEY]           process web UI requests, refresh statuses, list pending
     backporter start <PR-URL> [version ...]   cherry-pick, push, open backport PRs (--ai: AI resolves conflicts)
     backporter run [--no-ai]                  scan, then backport everything with Decision Approved
+    backporter check                          try undecided items locally: discard those that make no sense, keep
+                                              the branches of the rest for `run`
     backporter continue <PR-URL> <version>    finish after resolving conflicts (--ai: let AI resolve them)
     backporter mark <PR-URL> <version> present|not-applicable [--by URL] [--note TEXT]
     backporter inspect [--version KEY]        AI checks failed CI of open backport PRs, pushes fixes that build
@@ -49,6 +51,8 @@ _VERSION_KEY_RE = re.compile(r"\b(?:stable|antalya)-\d+\.\d+\b")
 BUILD_ATTEMPTS = 3
 # Source PRs per filtered project read; GitHub doesn't document the filter's length limit (120 URLs worked).
 SOURCES_PER_READ = 50
+# Note prefix of items `check` has tried; later checks skip them.
+CHECKED = "Checked:"
 
 
 def source_url(pr_repo: str, number: int) -> str:
@@ -711,14 +715,12 @@ def record_present(
     set_outcome(project, item, PRESENT, f"{note}; {found}" if note else f"Already in {version.branch}; {found}", by)
 
 
-def resolve_with_ai(
-    gh: Github, project: Project, config: Config, item: Item, version: Version, source: Source, repo_dir: str,
-    conflicts: list[tuple[str, str]],
-) -> bool:
+def ai_resolution(
+    version: Version, source: Source, repo_dir: str, conflicts: list[tuple[str, str]],
+) -> tuple[ai.Result, str, str]:
     """
-    Commit the cherry-pick (or merge) with its conflicts as-is, let the AI resolve them, commit the resolution
-    separately, and act on the AI's outcome. False if it stayed unresolved (the conflicts are then left in progress
-    again). A bump can only be resolved or unresolved.
+    Commit the cherry-pick (or merge) with its conflicts as-is and let the AI resolve them; a resolution is
+    committed separately. Returns the AI's result, the conflict commit and the resolution commit ('' unless RESOLVED).
     """
     branch = backport_branch(version, source.url)
     conflict_sha = git_ops.commit_conflicts(repo_dir, conflicts)
@@ -734,11 +736,26 @@ def resolve_with_ai(
             conflict_sha,
         )
     result = ai.resolve(repo_dir, prompt, conflicts)
+    resolution_sha = ""
     if result.outcome == ai.RESOLVED:
         resolution_sha = git_ops.commit_resolution(
             repo_dir, f"Resolve conflicts in {source.subject}\n\n{result.note}\n"
         )
         print(f"Committed the resolution: {resolution_sha[:12]}")
+    return result, conflict_sha, resolution_sha
+
+
+def resolve_with_ai(
+    gh: Github, project: Project, config: Config, item: Item, version: Version, source: Source, repo_dir: str,
+    conflicts: list[tuple[str, str]],
+) -> bool:
+    """
+    Let the AI resolve the conflicts (see ai_resolution) and act on its outcome. False if it stayed unresolved
+    (the conflicts are then left in progress again). A bump can only be resolved or unresolved.
+    """
+    branch = backport_branch(version, source.url)
+    result, conflict_sha, resolution_sha = ai_resolution(version, source, repo_dir, conflicts)
+    if result.outcome == ai.RESOLVED:
         # A bump's merge commit is kept even if it changes nothing: it records the merged tag.
         if not source.tag and git_ops.same_tree(repo_dir, version.branch):
             record_present(gh, project, item, version, source, repo_dir, f"AI: {result.note}")
@@ -809,11 +826,16 @@ def backport(
     for v in sort_versions(targets):
         item = items[v.key]
         print(f"\n=== {v.key} ===")
-        # A leftover local branch of an attempt that got no PR is recreated without asking.
+        # A leftover local branch of an attempt that got no PR is recreated without asking, unless `check` kept it.
         replace = item.status == NOT_STARTED and find_backport_pr(repo, item, v) is None
-        outcome, conflicts = apply(
-            dirs[v.key], TARGET_REPO, v.branch, backport_branch(v, source.url), source.repo, ref, replace
-        )
+        branch = backport_branch(v, source.url)
+        comment = git_ops.checked_comment(dirs[v.key], branch) if replace else None
+        if comment is not None:
+            print(f"Reusing {branch} kept by `backporter check`")
+            if not finish_backport(gh, project, config, item, v, source, dirs[v.key], comment):
+                ok = False
+            continue
+        outcome, conflicts = apply(dirs[v.key], TARGET_REPO, v.branch, branch, source.repo, ref, replace)
         if outcome == git_ops.EMPTY:
             record_present(gh, project, item, v, source, dirs[v.key])
             continue
@@ -910,6 +932,112 @@ def cmd_run(args, gh: Github, config: Config) -> None:
             print(f"Error: {e}", file=sys.stderr)
             for v in targets:
                 project.set_value(items[v.key].id, F_NOTE, f"backporter run failed: {e}")
+            failed = True
+    if failed:
+        sys.exit(1)
+
+
+def check_version(
+    gh: Github, project: Project, item: Item, version: Version, source: Source, repo_dir: str, use_ai: bool,
+) -> None:
+    """
+    Try the backport (or bump) of source into version in repo_dir, without pushing anything. If it makes no sense,
+    the branch is dropped and the item becomes Already present or Not applicable, with Decision Discarded. If it
+    applies, cleanly or resolved by the AI, the branch is kept for `run` to reuse. Unresolved conflicts drop the
+    branch and leave the item as it is. Note says what happened.
+    """
+    branch = backport_branch(version, source.url)
+    apply = git_ops.merge_tag if source.tag else git_ops.cherry_pick
+    ref = source.tag or git_ops.get_merge_commit_sha(source.pr)
+    outcome, conflicts = apply(repo_dir, TARGET_REPO, version.branch, branch, source.repo, ref, True)
+    if outcome == git_ops.EMPTY:
+        record_present(gh, project, item, version, source, repo_dir)
+        discard(project, item)
+        return
+    note = f"{CHECKED} the {source.operation} applies cleanly; local branch {branch} kept"
+    comment = ""
+    if outcome == git_ops.CONFLICTS:
+        files = ", ".join(path for path, _ in conflicts)
+        if not use_ai:
+            git_ops.drop_backport_branch(repo_dir, version.branch, branch)
+            project.set_value(item.id, F_NOTE, f"{CHECKED} conflicts in {files}; AI unavailable to resolve them")
+            print(f"{version.key}: conflicts in {files}; branch dropped")
+            return
+        result, conflict_sha, resolution_sha = ai_resolution(version, source, repo_dir, conflicts)
+        resolved = result.outcome == ai.RESOLVED
+        if not source.tag and (
+            result.outcome == ai.ALREADY_PRESENT or (resolved and git_ops.same_tree(repo_dir, version.branch))
+        ):
+            record_present(gh, project, item, version, source, repo_dir, f"AI: {result.note}", result.by or None)
+            discard(project, item)
+            return
+        if not source.tag and result.outcome == ai.NOT_APPLICABLE:
+            git_ops.drop_backport_branch(repo_dir, version.branch, branch)
+            set_outcome(project, item, NOT_APPLICABLE, f"AI: {result.note}")
+            discard(project, item)
+            return
+        if not resolved:
+            git_ops.discard_changes(repo_dir)
+            git_ops.drop_backport_branch(repo_dir, version.branch, branch)
+            project.set_value(item.id, F_NOTE, f"{CHECKED} AI could not resolve conflicts in {files}: {result.note}")
+            print(f"{version.key}: AI could not resolve the conflicts; branch dropped")
+            return
+        note = f"{CHECKED} AI resolved conflicts: {result.note}; local branch {branch} kept"
+        comment = conflict_comment(conflicts, conflict_sha, resolution_sha, result, source.operation)
+    git_ops.keep_checked(repo_dir, branch, comment)
+    project.set_value(item.id, F_NOTE, note)
+    print(f"{version.key}: {note}")
+
+
+def discard(project: Project, item: Item) -> None:
+    project.set_value(item.id, F_DECISION, DISCARDED)
+    print(f"{item.version}: Decision {DISCARDED}")
+
+
+def cmd_check(args, gh: Github, config: Config) -> None:
+    """Try every undecided Not started item that has a clone dir locally (see check_version)."""
+    print(f"Reading project {config.project_owner}#{config.project_number}...", flush=True)
+    project = open_project(gh, config)
+    versions = project_versions(project, config)
+    dirs = load_dirs(args.dirs, versions)
+    use_ai = True
+    if reason := ai.unavailable():
+        print(f"AI conflict resolution is off for this check: {reason}", file=sys.stderr)
+        use_ai = False
+    undecided: dict[str, list[Item]] = defaultdict(list)
+    for item in tracked_items(project, ACTIVE_FILTER):
+        if item.status == NOT_STARTED and not item.decision and not item.note.startswith(CHECKED):
+            undecided[item.source_pr].append(item)
+    if not undecided:
+        print("\nNothing to check.")
+        return
+    count = sum(len(its) for its in undecided.values())
+    print(f"\nUndecided: {count} item(s) in {len(undecided)} PR(s); AI for conflicts: {'on' if use_ai else 'off'}")
+    repo = gh.get_repo(TARGET_REPO)
+    failed = False
+    for n, (url, its) in enumerate(undecided.items(), 1):
+        print(f"\n##### [{n}/{len(undecided)}] {url}: {', '.join(i.version for i in its)}")
+        items = {i.version: i for i in its}
+        targets = [v for v in versions if v.key in items]
+        no_dir = [v.key for v in targets if v.key not in dirs]
+        if no_dir:
+            print(f"No clone dir for {', '.join(no_dir)}; skipped", file=sys.stderr)
+        targets = [v for v in targets if v.key in dirs]
+        if not targets:
+            continue
+        try:
+            source = load_source(gh, url)
+            if source.pr and not source.pr.merged:
+                print("Source PR is not merged yet; skipped", file=sys.stderr)
+                continue
+            for v in sort_versions(targets):
+                print(f"\n=== {v.key} ===")
+                if find_backport_pr(repo, items[v.key], v):
+                    print("It has a backport PR already; skipped (`backporter scan` updates it)")
+                    continue
+                check_version(gh, project, items[v.key], v, source, dirs[v.key], use_ai)
+        except (RuntimeError, ValueError, GithubException) as e:
+            print(f"Error: {e}", file=sys.stderr)
             failed = True
     if failed:
         sys.exit(1)
@@ -1193,6 +1321,12 @@ def main() -> None:
     )
     p.add_argument("--no-ai", action="store_true", help="Don't use AI for conflicts (default: [run] ai in config)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "check", parents=[with_dirs],
+        help="Try undecided Not started items locally (nothing is pushed); discard those that make no sense",
+    )
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("continue", parents=[with_dirs], help="Finish a backport after resolving conflicts")
     p.add_argument("pr", help="Source PR URL, or release URL for a bump")
