@@ -2,8 +2,8 @@
 GitHub Projects v2 storage for backport items (GraphQL via PyGithub's requester).
 
 Each tracked item is a draft issue for one (source PR, version) pair.
-Items without a Requested value are requests added by hand in the web UI; items with Requested "port" are
-existing backport PRs added by hand in the Add port view.
+Items without a Requested value are requests added by hand in the web UI. A request that is a PR with another PR
+(or release) in Source PR is an existing port of it.
 Versions are the options of the Version field; their branches come from the config.
 """
 
@@ -42,8 +42,6 @@ DISCARDED = "Discarded"
 
 EXPLICIT = "explicit"
 IMPLIED = "implied"
-# Set by the Add port view's filter on the PRs added there; scan turns them into tracked rows.
-PORT = "port"
 
 STATUS_COLORS = {
     NOT_STARTED: "GRAY", CONFLICTS: "RED", PR_OPEN: "YELLOW", MERGED: "GREEN", CLOSED: "PURPLE",
@@ -58,15 +56,13 @@ DECISION_COLORS = {APPROVED: "BLUE", DISCARDED: "GRAY"}
 # Backport PR isn't shown: once it exists, the row is that PR (its Title links to it). Not needed from is set in
 # requests only; rows it excludes are Not applicable with the reason in Note.
 _TABLE_FIELDS = [F_DECISION, F_STATUS, F_VERSION, F_REQUESTED, F_REQUESTED_BY, F_NOTE]
-_REQUESTS_FIELDS = [F_VERSION, F_NOT_NEEDED_FROM, F_NOTE]
-_PORTS_FIELDS = [F_SOURCE_PR, F_NOTE]
+_REQUESTS_FIELDS = [F_VERSION, F_NOT_NEEDED_FROM, F_SOURCE_PR, F_NOTE]
 _BOARD_FIELDS = [F_VERSION, F_DECISION]
 REQUESTS_VIEW = "Requests"
-PORTS_VIEW = "Add port"
-# Built-in columns that are always empty for draft items (in Requests also Status, and Source PR: the row is the PR).
+# Built-in columns that are always empty for draft items (in Requests also Status).
 _HIDDEN_FIELDS = {"Assignees", "Linked pull requests", "Sub-issues progress"}
 FLAVOR_COLORS = {"stable": "BLUE", "antalya": "ORANGE"}
-REQUESTED_COLORS = {EXPLICIT: "GREEN", IMPLIED: "GRAY", PORT: "BLUE"}
+REQUESTED_COLORS = {EXPLICIT: "GREEN", IMPLIED: "GRAY"}
 
 _OWN_FIELDS = {
     F_SOURCE_PR, F_VERSION, F_FLAVOR, F_REQUESTED, F_STATUS, F_BACKPORT_PR, F_NOTE, F_DECISION, F_REQUESTED_BY,
@@ -148,11 +144,9 @@ class Item:
     values: dict[str, str] = field(default_factory=dict)
 
 
-# Tracked rows only: unprocessed requests (no Requested value yet) belong in the Requests view, unprocessed
-# ports in the Add port view.
-TRACKED_FILTER = f"has:requested -requested:{PORT}"
+# Tracked rows only: unprocessed requests (no Requested value yet) belong in the Requests view.
+TRACKED_FILTER = "has:requested"
 REQUESTS_FILTER = "no:requested"
-PORTS_FILTER = f"requested:{PORT}"
 # Tracked rows the backporter still works on.
 ACTIVE_FILTER = (
     f"{TRACKED_FILTER} -status:" + ",".join(f'"{s}"' for s in FINAL_STATUSES) + f" -decision:{DISCARDED}"
@@ -243,8 +237,6 @@ class Project:
         self._ensure_requests_first()
         if "All" not in self.views:
             self._create_view("All", "BOARD_LAYOUT", TRACKED_FILTER)
-        if PORTS_VIEW not in self.views:
-            self._create_view(PORTS_VIEW, "TABLE_LAYOUT", PORTS_FILTER)
         for key in self.version_keys():
             if key not in self.views:
                 self._create_version_view(key)
@@ -347,15 +339,11 @@ class Project:
         for view in self.views.values():
             if view["name"] == REQUESTS_VIEW:
                 wanted = _REQUESTS_FIELDS
-            elif view["name"] == PORTS_VIEW:
-                wanted = _PORTS_FIELDS
             elif view["layout"] == "BOARD_LAYOUT":
                 wanted = _BOARD_FIELDS
             else:
                 wanted = _TABLE_FIELDS
             if view["name"] == REQUESTS_VIEW:
-                hidden = _HIDDEN_FIELDS | {F_STATUS, F_SOURCE_PR}
-            elif view["name"] == PORTS_VIEW:
                 hidden = _HIDDEN_FIELDS | {F_STATUS}
             elif view["layout"] == "TABLE_LAYOUT":
                 hidden = _HIDDEN_FIELDS | {F_BACKPORT_PR, F_NOT_NEEDED_FROM}
@@ -393,16 +381,12 @@ class Project:
         print(f"Created view '{key}' (grouped by Status)")
 
     def _fix_old_filters(self) -> None:
-        """
-        Views created before TRACKED_FILTER also showed unprocessed requests or ports; give their default filter
-        TRACKED_FILTER.
-        """
+        """Views created before TRACKED_FILTER also showed unprocessed requests; add it to their default filter."""
         self._load_fields()
-        old = {key: (f'version:"{key}"', f'version:"{key}" has:requested') for key in self.version_keys()}
-        old["All"] = ("", "has:requested")
-        for name, filters in old.items():
+        old = {key: f'version:"{key}"' for key in self.version_keys()} | {"All": ""}
+        for name, filter_ in old.items():
             view = self.views.get(name)
-            if view and (view["filter"] or "") in filters:
+            if view and (view["filter"] or "") == filter_:
                 new = _version_filter(name) if name != "All" else TRACKED_FILTER
                 self.requester.graphql_named_mutation(
                     "updateProjectV2View", {"viewId": view["id"], "filter": new}, "clientMutationId"

@@ -43,7 +43,7 @@ from backporter.config import (
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
     APPROVED, DISCARDED, F_DECISION, F_NOT_NEEDED_FROM, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
-    ACTIVE_FILTER, PORTS_FILTER, REQUESTS_FILTER, TO_DISCARD_FILTER, TRACKED_FILTER, source_filter,
+    ACTIVE_FILTER, REQUESTS_FILTER, TO_DISCARD_FILTER, TRACKED_FILTER, source_filter,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -567,12 +567,27 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
     body; versions come from
     the Version field and from version keys in the title, body or Note. Whoever added the request row
     becomes "Requested by".
+    An item that is a PR whose Source PR names another PR (or release) is an existing port of it instead, and
+    becomes that source's row (see attach_port).
+    Returns the items created, and the rows ports became.
     """
     keys = set(project.version_keys())
     created: list[Item] = []
     for item in project.items(REQUESTS_FILTER):
         if item.requested:
             continue
+        if item.content_url and item.source_pr:
+            try:
+                if parse_source(item.source_pr) != parse_source(item.content_url):
+                    pr_repo, number = git_ops.parse_pr_url(item.content_url)
+                    port = gh.get_repo(pr_repo).get_pull(number)
+                    ported = attach_port(gh, project, config, port, item.id, item.source_pr, item.creator, created)
+                    if not any(i is ported for i in created):
+                        created.append(ported)
+                    continue
+            except ValueError as e:
+                print(f"Port '{item.title}': {e}; skipped", file=sys.stderr)
+                continue
         text = " ".join((item.source_pr, item.content_url, item.title, item.body))
         try:
             url = parse_source(text)
@@ -653,28 +668,8 @@ def cmd_add_port(args, gh: Github, config: Config) -> None:
     project = open_project(gh, config)
     pr_repo, number = git_ops.parse_pr_url(args.port)
     port = gh.get_repo(pr_repo).get_pull(number)
-    row = next((i for i in project.items(PORTS_FILTER) if i.content_url == port.html_url), None)
+    row = next((i for i in project.items(REQUESTS_FILTER) if i.content_url == port.html_url), None)
     attach_port(gh, project, config, port, row.id if row else None, args.pr, gh.get_user().login, [])
-
-
-def process_ports(gh: Github, project: Project, config: Config, created: list[Item]) -> list[Item]:
-    """
-    Turn PRs added by hand in the Add port view into tracked rows (see attach_port). The source comes from the
-    Source PR field; whoever added the PR becomes "Requested by". A PR that can't be attached stays in the view.
-    """
-    attached = []
-    for item in project.items(PORTS_FILTER):
-        try:
-            if not item.content_url:
-                raise ValueError("not a PR")
-            if not item.source_pr:
-                raise ValueError("no Source PR")
-            pr_repo, number = git_ops.parse_pr_url(item.content_url)
-            port = gh.get_repo(pr_repo).get_pull(number)
-            attached.append(attach_port(gh, project, config, port, item.id, item.source_pr, item.creator, created))
-        except ValueError as e:
-            print(f"Port '{item.title}': {e}; skipped", file=sys.stderr)
-    return attached
 
 
 def cmd_remove(args, gh: Github, config: Config) -> None:
@@ -712,8 +707,6 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
     project = open_project(gh, config)
     print("Processing requests...", flush=True)
     created = process_requests(gh, project, config)
-    print("Processing ports...", flush=True)
-    attached = process_ports(gh, project, config, created)
     version_list = project_versions(project, config)
     if only_version:
         find_version(version_list, only_version)
@@ -722,11 +715,9 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
     for item in tracked_items(project, TO_DISCARD_FILTER):
         project.set_value(item.id, F_STATUS, DISCARDED)
         print(f"{item.version} {item.source_pr}: {item.status} -> {DISCARDED}", flush=True)
-    # Rows replaced by ports may still be listed for a while.
-    ported = {(i.source_pr, i.version) for i in attached}
-    items = [i for i in tracked_items(project, ACTIVE_FILTER) if (i.source_pr, i.version) not in ported]
-    listed = {i.id for i in items}
-    items += [i for i in {i.id: i for i in created + attached}.values() if i.id not in listed]
+    # GitHub's item list may lag behind: missing new rows, or still listing rows replaced by ports.
+    known = {(i.source_pr, i.version) for i in created}
+    items = [i for i in tracked_items(project, ACTIVE_FILTER) if (i.source_pr, i.version) not in known] + created
     # Status Discarded whose Decision is no longer Discarded (the active rows exclude Decision Discarded).
     for item in items:
         if item.status == DISCARDED:
