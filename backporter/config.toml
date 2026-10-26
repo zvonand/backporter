@@ -5,6 +5,7 @@ project_number = 39
 # Branch in Altinity/ClickHouse for each version key (<flavor>-X.Y).
 # Every version in the project needs an entry; add it here before `backporter add-version`.
 [branches]
+"stable-24.8" = "releases/24.8.14"
 "stable-25.3" = "releases/25.3.14"
 "stable-25.8" = "stable-25.8"
 "stable-26.3" = "stable-26.3"
@@ -36,8 +37,9 @@ ai = true
 
 # CMake configure command per version key, used by `backporter inspect` to build an AI fix before pushing it.
 # It runs in <clone dir>/build-<version key> (so `..` is the source), once, before the first `ninja` there.
-# Compilers follow COMPILER_C/COMPILER_CPP in each branch's ci/defs/defs.py.
+# Compilers follow COMPILER_C/COMPILER_CPP in each branch's ci/defs/defs.py (for 24.8: compiler in tests/ci/ci_config.py).
 [cmake]
+"stable-24.8" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 .."
 "stable-25.3" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 .."
 "stable-25.8" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 .."
 "stable-26.3" = "cmake -G Ninja -DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21 .."
@@ -53,6 +55,7 @@ ai = true
 all = ["backport"]
 stable = ["stable"]
 antalya = ["antalya"]
+"stable-24.8" = ["24.8", "24.8.14"]
 "stable-25.3" = ["25.3", "25.3.14"]
 "stable-25.8" = ["25.8", "stable-25.8"]
 # The convention adds "stable-26.3", but that label doesn't exist in Altinity/ClickHouse yet.

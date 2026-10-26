@@ -241,6 +241,7 @@ The project is the source of truth. People set Decision (and the request cells);
 3. Make sure each version's branch is in `[branches]` of `backporter/config.toml`, then add the versions:
 
    ```bash
+   backporter add-version 24.8 --flavor stable
    backporter add-version 25.3 --flavor stable
    backporter add-version 25.8 --flavor both
    backporter add-version 26.3 --flavor both
