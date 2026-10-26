@@ -46,6 +46,21 @@ Everything else works as for backports: Decision, Status, `run`, `start`, `conti
 
 A bump PR follows the team's convention: branch `bump/<branch>/<X.Y.Z>`, title `<Stable|Antalya> X.Y: Bump to X.Y.Z`, a merge commit `Merge tag '<tag>' into bump/<branch>/<X.Y.Z>`, and the same labels and builds project as a backport PR. If the tag is already in the branch, the item becomes `Already present`.
 
+### Tracking an existing port
+
+A backport or bump PR made outside the backporter (by hand, or a port with changes of its own) can be tracked like the ones it opens:
+
+1. Open the **Add port** view, paste the port PR's link (a PR in `Altinity/ClickHouse`) into the bottom row and press Enter. The view sets the row's **Requested** to `port`.
+2. In the row's **Source PR** cell, paste the link of the PR it ports, or the release link for a bump.
+3. The next `backporter scan` makes the port the tracked row of that source for the version whose branch the port targets (its base branch, looked up in `[branches]`). The row moves to that version's view with Requested `explicit`, Status from the port (`PR open` / `Merged` / `Closed`), and the port is added to its builds project like any backport PR.
+
+Only that version is tracked: no implied versions are added, so `scan` reports them as missing for that PR. One version has one port:
+- If the source is already tracked for that version, the port takes over its row and its values (Decision, Requested, Note, …).
+- A row marked `Already present` or `Not applicable` is overwritten; its old Status and Note go into Note as `Was <status>: <note>`.
+- A row that already has another backport PR is left alone and the port is skipped.
+
+A port is also skipped, and stays in **Add port**, if it isn't a PR in `Altinity/ClickHouse`, its base branch is no version's branch, or it has no Source PR. `scan` prints the reason. On the command line: `backporter add-port <port-URL> <source-URL>` (see [`add-port`](#add-port)).
+
 ### From the command line
 
 ```bash
@@ -200,8 +215,8 @@ Each item is one (source PR, version) pair, or (release, version) for a bump. It
 | Source PR | URL of the PR being backported, or of the release for a bump |
 | Version | Version key, e.g. `stable-25.8` |
 | Flavor | `stable` / `antalya` |
-| Requested | `explicit` (named in `add` or a request) or `implied` (required by the propagation rules) |
-| Requested by | GitHub login of whoever added the request row (for `backporter add`: the token's owner). Implied rows, including those added later by `add-version`, get the same person. |
+| Requested | `explicit` (named in `add`, a request or a port) or `implied` (required by the propagation rules); `port` on a PR in **Add port** that `scan` hasn't processed yet |
+| Requested by | GitHub login of whoever added the request or port row (for `backporter add` and `add-port`: the token's owner). Implied rows, including those added later by `add-version`, get the same person. |
 | Decision | Set by people: empty (undecided), `Approved`, `Discarded` (see [Deciding what gets done](#deciding-what-gets-done-also-from-the-web-page)) |
 | Status | Set by the backporter: `Not started`, `Conflicts`, `PR open`, `Merged`, `Closed`, `Already present`, `Not applicable` |
 | Backport PR | URL of the backport PR in `Altinity/ClickHouse`; for `Already present`, the PR that already brought the change (Altinity or ClickHouse) |
@@ -211,18 +226,21 @@ Draft items can't have comments, so the explanation goes in `Note`. Notes and fo
 
 ### Views
 
-- One table view per version, named by its key, filtered with `version:"<key>" has:requested` (tracked rows only, so unprocessed requests stay in `Requests`) and grouped by Status. For example, open the `stable-25.8` view to see everything going into stable 25.8. Grouping can only be set when a view is created (via the REST API), so views created by older versions of the backporter have to be recreated to get it.
+- One table view per version, named by its key, filtered with `version:"<key>" has:requested -requested:port` (tracked rows only, so unprocessed requests stay in `Requests` and unprocessed ports in `Add port`) and grouped by Status. For example, open the `stable-25.8` view to see everything going into stable 25.8. Grouping can only be set when a view is created (via the REST API), so views created by older versions of the backporter have to be recreated to get it.
 - `Requests`: the first tab, which the project opens with. It shows requests added in the web page that `scan` hasn't processed yet (filter `no:requested`), so a processed request disappears from it, replaced by tracked items in the version views. See [Requesting a backport](#requesting-a-backport) and [Requesting a bump](#requesting-a-bump). GitHub can't reorder tabs through the API, so `init` turns GitHub's default first view ("View 1") into `Requests`. If someone has already customized the first view, `init` leaves it alone and asks you to drag the `Requests` tab to the front.
-- `All`: a board of all tracked rows (filter `has:requested`).
+- `Add port`: existing backport PRs added by hand that `scan` hasn't processed yet (filter `requested:port`; GitHub sets that value on items added in the view). See [Tracking an existing port](#tracking-an-existing-port).
+- `All`: a board of all tracked rows (filter `has:requested -requested:port`).
+
+`init` changes the filters of `All` and the version views from the older `has:requested` (or no filter) to these.
 
 `init` and `add-version` set up the columns of every view. Views created through the API would otherwise show only GitHub's defaults.
-- **Shown:** Decision, Status, Version, Requested, Requested by and Note. Hidden in the tables: Backport PR, because a row with a backport PR is that PR, and Not needed from, which is set in requests; the rows it excludes are `Not applicable` with the reason in Note. `Requests` gets only Version and Note (its rows are the PRs themselves), and the board's cards get Version and Decision.
+- **Shown:** Decision, Status, Version, Requested, Requested by and Note. Hidden in the tables: Backport PR, because a row with a backport PR is that PR, and Not needed from, which is set in requests; the rows it excludes are `Not applicable` with the reason in Note. `Requests` gets only Version and Note (its rows are the PRs themselves), `Add port` Source PR and Note, and the board's cards get Version and Decision.
 - **Hidden:** the built-in Assignees, Linked pull requests and Sub-issues progress, which are always empty for draft items.
 - **Left alone:** other columns you turn on yourself.
 
 GitHub's API can't set column order. Columns follow the order in which the fields were created, so `init` creates the fields people use first: Decision, Backport PR, Note, then Requested, Requested by, Flavor and Source PR. Version and Not needed from come last, because GitHub won't create a select field without options and the first `add-version` creates them. To change the order in a view, drag the column headers in the web page and save the view.
 
-The project is the source of truth. People set Decision (and the request cells); everything else is maintained by the backporter.
+The project is the source of truth. People set Decision (and the request and port cells); everything else is maintained by the backporter.
 
 ## Setup
 
@@ -233,7 +251,7 @@ The project is the source of truth. People set Decision (and the request cells);
    backporter init https://github.com/orgs/Altinity/projects/<N>
    ```
 
-   - **Empty project:** it creates the fields and the `Requests` and `All` views, and replaces the built-in Status options (Todo / In Progress / Done) with the ones above.
+   - **Empty project:** it creates the fields and the `Requests`, `All` and `Add port` views, and replaces the built-in Status options (Todo / In Progress / Done) with the ones above.
    - **Project already formatted by the backporter** (it has a `Source PR` field): only adds what is missing, and keeps existing items and views.
    - **Any other non-empty project** (has items or custom fields): refused and left untouched.
 
@@ -277,6 +295,14 @@ The command-line equivalent of a web request, with Requested by = the token's ow
 - Re-running is safe and fills in any missing implied items.
 - With a release URL instead of `<PR-URL>`, it tracks a [bump](#requesting-a-bump): `<version>` must be the release's X.Y, and `--not-needed-from` isn't allowed.
 
+### `add-port`
+
+```bash
+backporter add-port <port-URL> <source-URL>
+```
+
+The command-line equivalent of [Tracking an existing port](#tracking-an-existing-port), with Requested by = the token's owner. `<port-URL>` is a backport or bump PR in `Altinity/ClickHouse`; its base branch gives the version. `<source-URL>` is the PR it ports, or the release for a bump. If the port is waiting in **Add port**, that row is used; otherwise the port is added to the project.
+
 ### `remove`
 
 ```bash
@@ -295,7 +321,7 @@ Example: with `stable-25.3` and `antalya-26.3` both explicit, `remove <PR> stabl
 backporter scan [--version KEY]
 ```
 
-1. Processes requests added in the web page (see [Requesting a backport](#requesting-a-backport)): each requested version is handled like `add`, then the request row is deleted.
+1. Processes requests added in the web page (see [Requesting a backport](#requesting-a-backport)): each requested version is handled like `add`, then the request row is deleted. Then processes ports in **Add port** like `add-port` (see [Tracking an existing port](#tracking-an-existing-port)).
 2. Refreshes every item that is not `Merged`, `Closed`, `Already present` or `Not applicable`, and not `Discarded`. It finds the backport PR from the item's `Backport PR` field, or else from a PR in `Altinity/ClickHouse` with head `backports/<branch>/<N>` (`bump/<branch>/<X.Y.Z>` for a bump), so backports and bumps opened by hand are picked up. It then sets `Backport PR` and Status (`PR open` / `Merged` / `Closed`), turns a draft row into that PR's row, and adds the PR to its builds project if it isn't there yet, replacing the source PR's row for that version as in step 7 of [`start`](#start). A merged PR is added without a Status; a closed one isn't added.
 3. Lists items still `Not started` or in `Conflicts`, grouped by version, with their Decision. `Discarded` items are left out.
 4. Reports PRs that are missing versions implied by their explicit requests.

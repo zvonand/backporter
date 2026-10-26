@@ -4,6 +4,7 @@ Backport tracker backed by a GitHub Project.
     backporter init <project-URL>             format an empty project and save its link to config
     backporter add-version X.Y --flavor F     add a version (stable, antalya or both) to the project
     backporter add <PR-URL> <version>         track a backport to version and every version it implies
+    backporter add-port <port-URL> <PR-URL>   track an existing backport PR (e.g. made by hand) of PR-URL
     backporter remove <PR-URL> <version>      stop tracking version and what only it implied
     backporter scan [--version KEY]           process web UI requests, refresh statuses, list pending
     backporter start <PR-URL> [version ...]   cherry-pick, push, open backport PRs (--ai: AI resolves conflicts)
@@ -42,7 +43,7 @@ from backporter.config import (
 from backporter.project import (
     CLOSED, CONFLICTS, EXPLICIT, F_BACKPORT_PR, F_FLAVOR, F_NOTE, F_REQUESTED, F_SOURCE_PR, F_STATUS, F_VERSION,
     APPROVED, DISCARDED, F_DECISION, F_NOT_NEEDED_FROM, F_REQUESTED_BY, FINAL_STATUSES, IMPLIED, MERGED, NOT_APPLICABLE, NOT_STARTED, PR_OPEN, PRESENT, Item, Project,
-    ACTIVE_FILTER, REQUESTS_FILTER, TO_DISCARD_FILTER, TRACKED_FILTER, source_filter,
+    ACTIVE_FILTER, PORTS_FILTER, REQUESTS_FILTER, TO_DISCARD_FILTER, TRACKED_FILTER, source_filter,
 )
 from backporter.rules import closure, plan_remove, sort_versions
 
@@ -202,6 +203,15 @@ def pr_items(project: Project, url: str) -> dict[str, Item]:
     return {i.version: i for i in tracked_items(project, source_filter([url])) if i.source_pr == url}
 
 
+def known_items(project: Project, url: str, created: list[Item]) -> dict[str, Item]:
+    """pr_items, plus the source's items in created, which GitHub's item list may not show yet."""
+    return {**pr_items(project, url), **{i.version: i for i in created if i.source_pr == url}}
+
+
+def pr_status(pr: PullRequest) -> str:
+    return MERGED if pr.merged_at else CLOSED if pr.state == "closed" else PR_OPEN
+
+
 def create_item(
     project: Project, version: Version, url: str, title: str, requested: str, requested_by: str,
     status: str = NOT_STARTED, note: str = "", not_needed_from: str = "",
@@ -238,18 +248,23 @@ def promote(project: Project, item: Item, backport: PullRequest) -> None:
     if backport.base.repo.full_name.lower() != TARGET_REPO.lower():
         raise RuntimeError(f"Refusing to add {backport.html_url} to the project: not in {TARGET_REPO}")
     github_guard.allow_project_content(backport.node_id)
-    new_id = project.add_existing_item(backport.node_id)
+    move(project, item, project.add_existing_item(backport.node_id), backport)
+    print(f"    the row is now {backport.html_url}")
+
+
+def move(project: Project, item: Item, row_id: str, pr: PullRequest) -> None:
+    """Give the project row row_id, which is pr, the item's field values, and delete the item's own row."""
     values = {
         F_SOURCE_PR: item.source_pr, F_VERSION: item.version, F_FLAVOR: item.flavor, F_REQUESTED: item.requested,
         F_REQUESTED_BY: item.requested_by, F_NOT_NEEDED_FROM: item.not_needed_from, F_DECISION: item.decision,
-        F_NOTE: item.note, F_STATUS: item.status,
+        F_NOTE: item.note, F_STATUS: item.status, F_BACKPORT_PR: item.backport_pr,
     }
     for field, value in values.items():
         if value:
-            project.set_value(new_id, field, value)
-    project.delete_item(item.id)
-    item.id, item.content_url, item.title = new_id, backport.html_url, backport.title
-    print(f"    the row is now {backport.html_url}")
+            project.set_value(row_id, field, value)
+    if item.id != row_id:
+        project.delete_item(item.id)
+    item.id, item.content_url, item.title = row_id, pr.html_url, pr.title
 
 
 _builds_projects: dict[int, Project] = {}
@@ -474,11 +489,11 @@ def cmd_add_version(args, gh: Github, config: Config) -> None:
 
 def track(
     gh: Github, project: Project, config: Config, pr_url: str, version_key: str, requested_by: str,
-    created: list[Item] | None = None, not_needed_from: str = "",
-) -> None:
+    created: list[Item] | None = None, not_needed_from: str = "", imply: bool = True,
+) -> Item:
     """
-    Track a backport of pr_url (or a bump to the release at pr_url) to version_key (explicit) and every version
-    it implies, for `requested_by`.
+    Track a backport of pr_url (or a bump to the release at pr_url) to version_key (explicit) and, with imply,
+    every version it implies, for `requested_by`. Returns version_key's item.
     Implied versions >= not_needed_from (a version number like '26.3') get new rows marked Not applicable;
     existing rows are left as they are, since other requests may need them.
     New items are appended to `created`; items already in it count as existing, since GitHub's
@@ -494,8 +509,9 @@ def track(
     bound = version_number(not_needed_from) if not_needed_from else None
     if bound and target.version >= bound:
         raise ValueError(f"{target.key} is not below 'Not needed from' {not_needed_from}")
-    existing = {**pr_items(project, url), **{i.version: i for i in created if i.source_pr == url}}
-    for v in closure(target, versions, bool(source.tag)):
+    existing = known_items(project, url, created)
+    result = existing.get(target.key)
+    for v in closure(target, versions, bool(source.tag)) if imply else [target]:
         requested = EXPLICIT if v == target else IMPLIED
         item = existing.get(v.key)
         if item and v == target and not_needed_from and item.not_needed_from != not_needed_from:
@@ -534,6 +550,9 @@ def track(
                 project, v, url, title, requested, requested_by,
                 not_needed_from=not_needed_from if v == target else "",
             ))
+        if v == target:
+            result = created[-1]
+    return result
 
 
 def cmd_add(args, gh: Github, config: Config) -> None:
@@ -589,6 +608,75 @@ def process_requests(gh: Github, project: Project, config: Config) -> list[Item]
     return created
 
 
+def attach_port(
+    gh: Github, project: Project, config: Config, port: PullRequest, row_id: str | None, source_text: str,
+    requested_by: str, created: list[Item],
+) -> Item:
+    """
+    Make port, an existing backport (or bump) PR in TARGET_REPO, the row of the source named in source_text for
+    the version whose branch port targets. Only that version is tracked (explicit, if its row is new), nothing it
+    implies. A row that is Already present or Not applicable is overwritten; a row with another PR is refused.
+    row_id is port's row in the project, if it has one. Status comes from port's state, and port is added to its
+    builds project.
+    """
+    if port.base.repo.full_name.lower() != TARGET_REPO.lower():
+        raise ValueError(f"{port.html_url} is not a PR into {TARGET_REPO}")
+    version = next((v for v in project_versions(project, config) if v.branch == port.base.ref), None)
+    if version is None:
+        raise ValueError(f"{port.html_url} targets {port.base.ref}, which is no version's branch")
+    url = parse_source(source_text)
+    if url == port.html_url:
+        raise ValueError(f"{port.html_url} is given as its own source")
+    old = known_items(project, url, created).get(version.key)
+    overwrite = old is not None and old.status in (PRESENT, NOT_APPLICABLE)
+    if old and old.content_url == port.html_url:
+        if not overwrite:
+            print(f"{version.key}: {port.html_url} is already tracked for {url}")
+            return old
+        row_id = old.id
+    elif old and not overwrite and (old.content_url or old.backport_pr):
+        raise ValueError(f"{version.key} of {url} already has {old.content_url or old.backport_pr}")
+    item = track(gh, project, config, url, version.key, requested_by, created, imply=False)
+    if overwrite:
+        item.note = f"Was {item.status}: {item.note}" if item.note else f"Was {item.status}"
+    item.status, item.backport_pr = pr_status(port), port.html_url
+    if row_id is None:
+        github_guard.allow_project_content(port.node_id)
+        row_id = project.add_existing_item(port.node_id)
+    move(project, item, row_id, port)
+    print(f"{version.key}: {port.html_url} is now the row of {url} ({item.status})")
+    sync_builds(gh, config, version, port, url)
+    return item
+
+
+def cmd_add_port(args, gh: Github, config: Config) -> None:
+    project = open_project(gh, config)
+    pr_repo, number = git_ops.parse_pr_url(args.port)
+    port = gh.get_repo(pr_repo).get_pull(number)
+    row = next((i for i in project.items(PORTS_FILTER) if i.content_url == port.html_url), None)
+    attach_port(gh, project, config, port, row.id if row else None, args.pr, gh.get_user().login, [])
+
+
+def process_ports(gh: Github, project: Project, config: Config, created: list[Item]) -> list[Item]:
+    """
+    Turn PRs added by hand in the Add port view into tracked rows (see attach_port). The source comes from the
+    Source PR field; whoever added the PR becomes "Requested by". A PR that can't be attached stays in the view.
+    """
+    attached = []
+    for item in project.items(PORTS_FILTER):
+        try:
+            if not item.content_url:
+                raise ValueError("not a PR")
+            if not item.source_pr:
+                raise ValueError("no Source PR")
+            pr_repo, number = git_ops.parse_pr_url(item.content_url)
+            port = gh.get_repo(pr_repo).get_pull(number)
+            attached.append(attach_port(gh, project, config, port, item.id, item.source_pr, item.creator, created))
+        except ValueError as e:
+            print(f"Port '{item.title}': {e}; skipped", file=sys.stderr)
+    return attached
+
+
 def cmd_remove(args, gh: Github, config: Config) -> None:
     url = parse_source(args.pr)
     project = open_project(gh, config)
@@ -624,6 +712,8 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
     project = open_project(gh, config)
     print("Processing requests...", flush=True)
     created = process_requests(gh, project, config)
+    print("Processing ports...", flush=True)
+    attached = process_ports(gh, project, config, created)
     version_list = project_versions(project, config)
     if only_version:
         find_version(version_list, only_version)
@@ -632,9 +722,11 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
     for item in tracked_items(project, TO_DISCARD_FILTER):
         project.set_value(item.id, F_STATUS, DISCARDED)
         print(f"{item.version} {item.source_pr}: {item.status} -> {DISCARDED}", flush=True)
-    items = tracked_items(project, ACTIVE_FILTER)
+    # Rows replaced by ports may still be listed for a while.
+    ported = {(i.source_pr, i.version) for i in attached}
+    items = [i for i in tracked_items(project, ACTIVE_FILTER) if (i.source_pr, i.version) not in ported]
     listed = {i.id for i in items}
-    items += [i for i in created if i.id not in listed]
+    items += [i for i in {i.id: i for i in created + attached}.values() if i.id not in listed]
     # Status Discarded whose Decision is no longer Discarded (the active rows exclude Decision Discarded).
     for item in items:
         if item.status == DISCARDED:
@@ -654,7 +746,7 @@ def scan(gh: Github, config: Config, only_version: str | None) -> None:
         pr = find_backport_pr(repo, item, version)
         if pr is None:
             continue
-        status = MERGED if pr.merged_at else CLOSED if pr.state == "closed" else PR_OPEN
+        status = pr_status(pr)
         promote(project, item, pr)
         sync_builds(gh, config, version, pr, item.source_pr)
         if pr.html_url != item.backport_pr:
@@ -1437,6 +1529,14 @@ def main() -> None:
         help="Version from which the backport isn't needed; those versions are marked Not applicable",
     )
     p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser(
+        "add-port", parents=[common],
+        help="Track an existing backport (or bump) PR, e.g. one made by hand, for the version its base branch is",
+    )
+    p.add_argument("port", help="URL of the backport PR in Altinity/ClickHouse")
+    p.add_argument("pr", help="Source PR URL, or release URL for a bump")
+    p.set_defaults(func=cmd_add_port)
 
     p = sub.add_parser("remove", parents=[common], help="Stop tracking a version and what only it implied")
     p.add_argument("pr", help="Source PR URL, or release URL for a bump")
